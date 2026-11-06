@@ -6,6 +6,7 @@ import com.phequals7.muesli.data.entity.CustomWord
 import com.phequals7.muesli.data.entity.DictationResult
 import com.phequals7.muesli.data.entity.RecordingSession
 import com.phequals7.muesli.data.entity.Transcript
+import com.phequals7.muesli.data.entity.MeetingTranscriptSegmentEntity
 import kotlinx.coroutines.flow.Flow
 import java.util.UUID
 
@@ -15,6 +16,7 @@ class SharedStore(private val context: Context) {
     private val dictationResultDao = database.dictationResultDao()
     private val recordingSessionDao = database.recordingSessionDao()
     private val transcriptDao = database.transcriptDao()
+    private val transcriptSegmentDao = database.transcriptSegmentDao()
 
     private val prefs: SharedPreferences = context.getSharedPreferences("muesli_prefs", Context.MODE_PRIVATE)
 
@@ -39,6 +41,7 @@ class SharedStore(private val context: Context) {
         private const val KEY_SPEAKER_LABELS = "speaker_labels"
         private const val KEY_BUBBLE_ENABLED = "bubble_enabled"
         private const val KEY_MIC_PREFERENCE = "mic_preference" // "auto", "phone", "bluetooth", "usb"
+        private const val KEY_LANGUAGE_HINT = "language_hint" // "auto", "en", "th", "zh", "yue"
     }
 
     // Onboarding settings
@@ -131,6 +134,11 @@ class SharedStore(private val context: Context) {
         get() = prefs.getBoolean(KEY_SPEAKER_LABELS, true)
         set(value) = prefs.edit().putBoolean(KEY_SPEAKER_LABELS, value).apply()
 
+    /** ASR language hint for multilingual models ("auto", "en", "th", "zh", "yue"). */
+    var languageHint: String
+        get() = prefs.getString(KEY_LANGUAGE_HINT, "auto") ?: "auto"
+        set(value) = prefs.edit().putString(KEY_LANGUAGE_HINT, value).apply()
+
     /** Floating quick-capture bubble over other apps (Android-exclusive). */
     var bubbleEnabled: Boolean
         get() = prefs.getBoolean(KEY_BUBBLE_ENABLED, false)
@@ -170,4 +178,14 @@ class SharedStore(private val context: Context) {
     suspend fun getTranscriptForSession(sessionId: String): Transcript? = transcriptDao.getTranscriptForSession(sessionId)
     suspend fun insertTranscript(transcript: Transcript) = transcriptDao.insertTranscript(transcript)
     suspend fun deleteTranscript(transcript: Transcript) = transcriptDao.deleteTranscript(transcript)
+
+    // Structured transcript segments (Room v5)
+    fun getTranscriptSegmentsFlow(sessionId: String): Flow<List<MeetingTranscriptSegmentEntity>> =
+        transcriptSegmentDao.observeSegmentsForSession(sessionId)
+
+    suspend fun getTranscriptSegments(sessionId: String): List<MeetingTranscriptSegmentEntity> =
+        transcriptSegmentDao.getSegmentsForSession(sessionId)
+
+    suspend fun replaceTranscriptSegments(sessionId: String, segments: List<MeetingTranscriptSegmentEntity>, inlineText: String) =
+        transcriptSegmentDao.replaceSegmentsForSession(sessionId, segments, inlineText)
 }

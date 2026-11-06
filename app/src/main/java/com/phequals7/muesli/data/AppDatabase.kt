@@ -9,10 +9,15 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 import com.phequals7.muesli.data.dao.CustomWordDao
 import com.phequals7.muesli.data.dao.DictationResultDao
 import com.phequals7.muesli.data.dao.RecordingSessionDao
+import com.phequals7.muesli.data.dao.SpeakerProfileDao
 import com.phequals7.muesli.data.dao.TranscriptDao
+import com.phequals7.muesli.data.dao.TranscriptSegmentDao
 import com.phequals7.muesli.data.entity.CustomWord
 import com.phequals7.muesli.data.entity.DictationResult
+import com.phequals7.muesli.data.entity.MeetingTranscriptSegmentEntity
 import com.phequals7.muesli.data.entity.RecordingSession
+import com.phequals7.muesli.data.entity.SpeakerProfileEntity
+import com.phequals7.muesli.data.entity.SpeakerProfileSampleEntity
 import com.phequals7.muesli.data.entity.Transcript
 
 @Database(
@@ -20,9 +25,12 @@ import com.phequals7.muesli.data.entity.Transcript
         CustomWord::class,
         DictationResult::class,
         RecordingSession::class,
-        Transcript::class
+        Transcript::class,
+        MeetingTranscriptSegmentEntity::class,
+        SpeakerProfileEntity::class,
+        SpeakerProfileSampleEntity::class
     ],
-    version = 4,
+    version = 5,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -30,7 +38,8 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun dictationResultDao(): DictationResultDao
     abstract fun recordingSessionDao(): RecordingSessionDao
     abstract fun transcriptDao(): TranscriptDao
-
+    abstract fun transcriptSegmentDao(): TranscriptSegmentDao
+    abstract fun speakerProfileDao(): SpeakerProfileDao
     companion object {
         @Volatile
         private var INSTANCE: AppDatabase? = null
@@ -58,8 +67,73 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * Room v4 → v5: adds `meeting_transcript_segments` (block-level synced
+         * playback + speaker attribution) and `speaker_profiles` /
+         * `speaker_profile_samples` (persistent CAM++ voiceprints).
+         */
+        private val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `meeting_transcript_segments` (
+                        `segmentId` TEXT NOT NULL PRIMARY KEY,
+                        `sessionId` TEXT NOT NULL,
+                        `orderIndex` INTEGER NOT NULL,
+                        `startMs` INTEGER NOT NULL,
+                        `endMs` INTEGER NOT NULL,
+                        `clusterId` INTEGER NOT NULL,
+                        `speakerProfileId` TEXT,
+                        `speakerLabel` TEXT NOT NULL,
+                        `badgeColorHex` TEXT NOT NULL DEFAULT '#1D63B8',
+                        `text` TEXT NOT NULL,
+                        `languageCode` TEXT,
+                        `clusterCentroidBlob` BLOB,
+                        FOREIGN KEY(`sessionId`) REFERENCES `recording_sessions`(`id`) ON DELETE CASCADE
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_meeting_transcript_segments_sessionId_startMs` " +
+                        "ON `meeting_transcript_segments` (`sessionId`, `startMs`, `endMs`)"
+                )
+
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `speaker_profiles` (
+                        `profileId` TEXT NOT NULL PRIMARY KEY,
+                        `displayName` TEXT NOT NULL,
+                        `badgeColorHex` TEXT NOT NULL,
+                        `sampleCount` INTEGER NOT NULL,
+                        `centroidEmbeddingBlob` BLOB NOT NULL,
+                        `createdAtMs` INTEGER NOT NULL,
+                        `updatedAtMs` INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `speaker_profile_samples` (
+                        `sampleId` TEXT NOT NULL PRIMARY KEY,
+                        `profileId` TEXT NOT NULL,
+                        `sourceSessionId` TEXT,
+                        `durationMs` INTEGER NOT NULL,
+                        `embeddingBlob` BLOB NOT NULL,
+                        `createdAtMs` INTEGER NOT NULL,
+                        FOREIGN KEY(`profileId`) REFERENCES `speaker_profiles`(`profileId`) ON DELETE CASCADE
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_speaker_profile_samples_profileId` " +
+                        "ON `speaker_profile_samples` (`profileId`)"
+                )
+            }
+        }
+
         /** Exposed for migration tests. */
-        internal val MIGRATIONS = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+        internal val MIGRATIONS = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
 
         fun getDatabase(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
@@ -75,5 +149,20 @@ abstract class AppDatabase : RoomDatabase() {
                 instance
             }
         }
+
+        @Volatile
+        private var PROFILE_STORE_INSTANCE: RoomSpeakerProfileStore? = null
+
+        /** Shared [RoomSpeakerProfileStore] bridging Room v5 and the diarizer. */
+        fun getSpeakerProfileStore(context: Context): RoomSpeakerProfileStore {
+            val db = getDatabase(context)
+            return PROFILE_STORE_INSTANCE ?: synchronized(this) {
+                PROFILE_STORE_INSTANCE ?: RoomSpeakerProfileStore(
+                    speakerProfileDao = db.speakerProfileDao(),
+                    transcriptSegmentDao = db.transcriptSegmentDao()
+                ).also { PROFILE_STORE_INSTANCE = it }
+            }
+        }
     }
+
 }

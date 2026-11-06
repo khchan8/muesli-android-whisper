@@ -14,8 +14,8 @@ android {
         applicationId = "com.phequals7.muesli"
         minSdk = 24
         targetSdk = 36
-        versionCode = 3
-        versionName = "0.3.0-alpha"
+        versionCode = 4
+        versionName = "2.0.0-alpha"
     }
 
     buildTypes {

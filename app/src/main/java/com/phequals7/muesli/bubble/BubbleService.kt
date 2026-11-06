@@ -222,8 +222,8 @@ class BubbleService : Service(), LifecycleOwner, SavedStateRegistryOwner {
 
     private fun startDictation() {
         if (uiState.state.value == BubbleState.RECORDING) return
-        Log.i(TAG, "startDictation: model downloaded=${ModelManager(this).isDownloaded()}")
-        if (!ModelManager(this).isDownloaded()) {
+        Log.i(TAG, "startDictation: model downloaded=${ModelManager.getInstance(this).isDownloaded()}")
+        if (!ModelManager.getInstance(this).isDownloaded()) {
             toast("${SpeechModels.selected(this).shortName} model is not downloaded — open Muesli Settings")
             collapseCard()
             return

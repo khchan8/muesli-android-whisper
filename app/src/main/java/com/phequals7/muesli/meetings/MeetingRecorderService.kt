@@ -27,6 +27,9 @@ import com.phequals7.muesli.data.entity.Transcript
 import com.phequals7.muesli.engine.SherpaRecognizerHolder
 import com.phequals7.muesli.model.ModelManager
 import com.phequals7.muesli.model.SpeechModels
+import com.phequals7.muesli.data.AppDatabase
+import com.phequals7.muesli.data.entity.MeetingTranscriptSegmentEntity
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -62,6 +65,7 @@ class MeetingRecorderService : Service() {
         const val EXTRA_SESSION_ID = "session_id"
         const val EXTRA_TITLE = "title"
         const val EXTRA_TEMPLATE_ID = "template_id"
+        const val EXTRA_EXPECTED_SPEAKERS = "expected_speakers"
 
         private const val SAMPLE_RATE = 16000
         private const val CHUNK_SECONDS = 30 // fallback when VAD is unavailable
@@ -88,6 +92,7 @@ class MeetingRecorderService : Service() {
     private var captureThread: Thread? = null
     private var wavFile: File? = null
     private var wavBytesWritten = 0L
+    private var expectedSpeakers = -1
 
     private val lock = Object()
     // Fixed-chunk fallback accumulation as append-only parts (concatenated
@@ -99,7 +104,7 @@ class MeetingRecorderService : Service() {
     private var samplesCaptured = 0L
     private var vad: Vad? = null
     private val finishedChunks = LinkedBlockingQueue<TimedChunk>()
-    private val transcriptParts = mutableListOf<SpeakerLabeler.TimedText>()
+    private val transcriptParts = mutableListOf<RawTranscriptChunk>()
     private val decodeBusy = AtomicBoolean(false)
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -116,6 +121,7 @@ class MeetingRecorderService : Service() {
                 val id = intent.getStringExtra(EXTRA_SESSION_ID) ?: UUID.randomUUID().toString()
                 val title = intent.getStringExtra(EXTRA_TITLE).orEmpty()
                 val templateId = intent.getStringExtra(EXTRA_TEMPLATE_ID) ?: MeetingTemplate.GENERAL.id
+                expectedSpeakers = intent.getIntExtra(EXTRA_EXPECTED_SPEAKERS, -1)
                 startRecording(id, title, templateId)
             }
             ACTION_STOP -> stopRecording(discard = false)
@@ -130,7 +136,7 @@ class MeetingRecorderService : Service() {
         if (capturing.get()) return
 
         val selectedModel = SpeechModels.selected(this)
-        if (!ModelManager(this, selectedModel).isDownloaded()) {
+        if (!ModelManager.getInstance(this).isDownloaded(selectedModel)) {
             failSession(id, title, templateId, "${selectedModel.shortName} model is not downloaded")
             return
         }
@@ -190,7 +196,7 @@ class MeetingRecorderService : Service() {
             // Warm the recognizer before opening the mic.
             decodeExecutor.execute {
                 try {
-                    SherpaRecognizerHolder.get(applicationContext)
+                    SherpaRecognizerHolder.prewarmAsync(applicationContext)
                 } catch (t: Throwable) {
                     Log.e(TAG, "Recognizer warm-up failed", t)
                 }
@@ -245,14 +251,28 @@ class MeetingRecorderService : Service() {
                 transcriptParts.joinToString("\n\n") { it.text }.trim()
             }
             val endedAt = System.currentTimeMillis()
-            val audioName = wavFile?.name
 
-            if (!discard && store.speakerLabelsEnabled && wavFile != null && finalText.isNotBlank()) {
-                finalText = try {
-                    diarizeAndLabel(finalText)
+            var diarizationResult: SpeakerDiarizer.DiarizationResult? = null
+            val wav = wavFile
+            if (!discard && store.speakerLabelsEnabled && wav != null && finalText.isNotBlank()) {
+                try {
+                    MeetingRecordingController.onDiarizationProgress(0.02f)
+                    diarizationResult = runBlocking {
+                        SpeakerDiarizer(
+                            applicationContext,
+                            AppDatabase.getSpeakerProfileStore(applicationContext)
+                        ).diarizeWavAndAlign(
+                            sessionId = id ?: "",
+                            wavFile = wav,
+                            rawChunks = synchronized(transcriptParts) { transcriptParts.toList() },
+                            expectedSpeakerCount = expectedSpeakers
+                        ) { progress ->
+                            MeetingRecordingController.onDiarizationProgress(progress)
+                        }
+                    }
+                    diarizationResult?.let { finalText = it.formattedInlineTranscript }
                 } catch (t: Throwable) {
                     Log.w(TAG, "Diarization failed, keeping unlabeled transcript: ${t.message}")
-                    finalText
                 }
             }
 
@@ -260,6 +280,10 @@ class MeetingRecorderService : Service() {
             // diarization is removed when retention is off.
             if (!retainAudio) {
                 wavFile?.delete()
+            } else {
+                wavFile?.takeIf { it.exists() && it.absolutePath.contains("Recordings") }?.let {
+                    MeetingStorageManager.indexRecordingInMediaStore(applicationContext, it)
+                }
             }
             releaseVad()
 
@@ -280,15 +304,33 @@ class MeetingRecorderService : Service() {
                                     ?: SpeechModels.selected(applicationContext).id
                             )
                             store.insertTranscript(transcript)
+
+                            // Structured segments: diarized speaker blocks when
+                            // diarization ran; otherwise one block per decoded chunk
+                            // (single speaker) so synchronized playback still works.
+                            val rawChunks = synchronized(transcriptParts) { transcriptParts.toList() }
+                            val segments = diarizationResult?.segments
+                                ?: SpeakerDiarizer(applicationContext)
+                                    .alignTurnsWithTranscriptChunks(id, emptyList(), rawChunks)
+                            store.replaceTranscriptSegments(
+                                id,
+                                segments.map { MeetingTranscriptSegmentEntity.fromDomainModel(it) },
+                                finalText
+                            )
+
+                            val storedAudioPath = wavFile?.takeIf { retainAudio }?.let { file ->
+                                if (file.absolutePath.contains("Recordings")) file.absolutePath else file.name
+                            }
                             store.updateRecordingSession(
                                 existing.copy(
                                     phase = "completed",
                                     endedAt = endedAt,
-                                    audioFileName = if (retainAudio) audioName else null,
+                                    audioFileName = storedAudioPath,
                                     transcriptID = transcript.id,
                                 )
                             )
                             maybeRunSummary(id, finalText)
+                            migrateLegacyRecordings()
                         }
                     }
                 }
@@ -298,17 +340,19 @@ class MeetingRecorderService : Service() {
         }
     }
 
-    /** Runs diarization on the recorded WAV and renders a speaker-grouped
-     * transcript. Falls back to the plain text on any inconsistency. */
-    private fun diarizeAndLabel(plainText: String): String {
-        val wav = wavFile ?: return plainText
-        val pcm = readWavSamples(wav)
-        if (pcm.size < SAMPLE_RATE) return plainText
-        val segments = SpeakerDiarizer(applicationContext).diarize(pcm)
-        if (segments.isEmpty()) return plainText
-        val chunks = synchronized(transcriptParts) { transcriptParts.toList() }
-        val labeled = SpeakerLabeler.render(chunks, segments)
-        return labeled.ifBlank { plainText }
+    /** One-time move of v0.3.x internal WAVs into /sdcard/Recordings/Muesli. */
+    private fun migrateLegacyRecordings() {
+        serviceScope.launch {
+            try {
+                MeetingStorageManager.migrateLegacyInternalRecordings(applicationContext) { legacyId, _, newPath ->
+                    store.getRecordingSessionById(legacyId)?.let { session ->
+                        store.updateRecordingSession(session.copy(audioFileName = newPath))
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "Legacy recording migration skipped: ${t.message}")
+            }
+        }
     }
 
     private fun releaseVad() {
@@ -441,9 +485,14 @@ class MeetingRecorderService : Service() {
         // user disabled audio retention it is written under a temp name and
         // deleted during finalizing.
         wavFile = if (store.retainMeetingAudio) {
-            File(filesDir, "meetings/${sessionId}.wav")
+            if (MeetingStorageManager.isPublicRecordingsWritable()) {
+                MeetingStorageManager.createPublicSessionWavFile(sessionId.orEmpty(), sessionTitle)
+            } else {
+                // shortcut: API < 29 without legacy-storage permission — keep the v0.3.x internal path
+                File(MeetingStorageManager.internalRecordingsDirectory(this), "$sessionId.wav")
+            }
         } else {
-            File(filesDir, "meetings/.tmp-${sessionId}.wav")
+            File(cacheDir, "temp_meetings/.tmp-$sessionId.wav")
         }.apply {
             parentFile?.mkdirs()
             writeWavHeader(this, 0)
@@ -573,10 +622,17 @@ class MeetingRecorderService : Service() {
             val chunk = finishedChunks.poll() ?: break
             if (chunk.pcm.size < SAMPLE_RATE / 2) continue
             try {
-                val text = decode(chunk.pcm)
-                if (text.isNotBlank()) {
+                val result = decode(chunk.pcm)
+                if (result.text.isNotBlank()) {
                     synchronized(transcriptParts) {
-                        transcriptParts.add(SpeakerLabeler.TimedText(chunk.startSec, chunk.endSec, text))
+                        transcriptParts.add(
+                            RawTranscriptChunk(
+                                startMs = (chunk.startSec * 1000).toLong(),
+                                endMs = (chunk.endSec * 1000).toLong(),
+                                text = result.text,
+                                languageCode = result.languageCode.takeUnless { it.isBlank() || it == "auto" }
+                            )
+                        )
                     }
                 }
             } catch (t: Throwable) {
@@ -589,17 +645,12 @@ class MeetingRecorderService : Service() {
      * re-decode doubles CPU use and the flickering preview tested poorly. */
     private fun schedulePartial() = Unit
 
-    private fun decode(pcm: FloatArray): String {
-        val recognizer = SherpaRecognizerHolder.get(applicationContext)
-        val stream = recognizer.createStream()
-        val raw = try {
-            stream.acceptWaveform(pcm, SAMPLE_RATE)
-            recognizer.decode(stream)
-            recognizer.getResult(stream).text.trim()
-        } finally {
-            stream.release()
+    private fun decode(pcm: FloatArray): com.phequals7.muesli.engine.TranscriptionResult {
+        val result = runBlocking {
+            SherpaRecognizerHolder.transcribe(applicationContext, pcm, store.languageHint)
         }
-        return postProcess(raw)
+        val processed = postProcess(result.text)
+        return if (processed.isBlank()) result else result.copy(text = processed)
     }
 
     /** Filler-word removal + custom dictionary, same pipeline as dictation
@@ -675,21 +726,6 @@ class MeetingRecorderService : Service() {
         }
     }
 
-    /** Reads a 16 kHz mono 16-bit WAV (as written by [appendToWav]) back into
-     * float samples for diarization. */
-    private fun readWavSamples(file: File): FloatArray {
-        val bytes = file.readBytes()
-        if (bytes.size <= 44) return FloatArray(0)
-        val count = (bytes.size - 44) / 2
-        val out = FloatArray(count)
-        for (i in 0 until count) {
-            val lo = bytes[44 + i * 2].toInt() and 0xFF
-            val hi = bytes[44 + i * 2 + 1].toInt()
-            val sample = (hi shl 8) or lo
-            out[i] = sample / 32768f
-        }
-        return out
-    }
 
     // ── notification ─────────────────────────────────────────────────────
 

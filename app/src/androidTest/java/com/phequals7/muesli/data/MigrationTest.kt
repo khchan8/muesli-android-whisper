@@ -99,7 +99,7 @@ class MigrationTest {
             .addMigrations(*AppDatabase.MIGRATIONS)
             .build()
 
-        // Opening the DB forces the migration chain v1 -> v4.
+        // Opening the DB forces the migration chain v1 -> v5.
         val results = runBlocking { db.dictationResultDao().getAllResults() }
         assertEquals(1, results.size)
         assertEquals("hello from v1", results[0].text)
@@ -112,6 +112,23 @@ class MigrationTest {
         assertEquals("", session.manualNotes)
         assertEquals("", session.summaryText) // MIGRATION_3_4 default
         assertEquals("notStarted", session.summaryState)
+
+        // MIGRATION_4_5: v2 speaker-profile and transcript-segment tables exist and are writable.
+        runBlocking {
+            db.speakerProfileDao().upsertProfile(
+                com.phequals7.muesli.data.entity.SpeakerProfileEntity(
+                    profileId = "p1",
+                    displayName = "Alice",
+                    badgeColorHex = "#1D63B8",
+                    sampleCount = 1,
+                    centroidEmbeddingBlob = ByteArray(768),
+                    createdAtMs = 1L,
+                    updatedAtMs = 1L
+                )
+            )
+            assertEquals("Alice", db.speakerProfileDao().getProfileById("p1")?.displayName)
+            assertEquals(0, db.transcriptSegmentDao().getSegmentsForSession("s1").size)
+        }
 
         db.close()
     }

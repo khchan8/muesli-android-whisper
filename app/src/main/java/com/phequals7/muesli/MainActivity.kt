@@ -57,7 +57,7 @@ class MainActivity : ComponentActivity() {
             // Post-onboarding launches only, and only when the model exists
             // and isn't already warm (iOS shouldShowLaunchWarmup parity)
             SharedStore(context).isOnboardingCompleted &&
-              ModelManager(context).isDownloaded() &&
+              ModelManager.getInstance(context).isDownloaded() &&
               SherpaRecognizerHolder.warmState != SherpaRecognizerHolder.WarmState.READY
           }
           var showWarmup by remember { mutableStateOf(shouldWarmup) }

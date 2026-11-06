@@ -1,0 +1,851 @@
+package com.phequals7.muesli.meetings
+
+import android.content.Context
+import android.util.Log
+import com.k2fsa.sherpa.onnx.FastClusteringConfig
+import com.k2fsa.sherpa.onnx.OfflineSpeakerDiarization
+import com.k2fsa.sherpa.onnx.OfflineSpeakerDiarizationConfig
+import com.k2fsa.sherpa.onnx.OfflineSpeakerDiarizationSegment
+import com.k2fsa.sherpa.onnx.OfflineSpeakerSegmentationModelConfig
+import com.k2fsa.sherpa.onnx.OfflineSpeakerSegmentationPyannoteModelConfig
+import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractor
+import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractorConfig
+import com.k2fsa.sherpa.onnx.SpeakerEmbeddingManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.UUID
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sqrt
+
+/**
+ * Represents a raw ASR chunk captured during live recording before or during diarization alignment.
+ */
+data class RawTranscriptChunk(
+    val startMs: Long,
+    val endMs: Long,
+    val text: String,
+    val languageCode: String? = null
+)
+
+/**
+ * Represents a structured, speaker-attributed transcript block for Room v5 (`meeting_transcript_segments`)
+ * and block-level synchronized audio playback in `MeetingDetailScreen.kt`.
+ */
+data class DiarizedTranscriptSegment(
+    val segmentId: String = UUID.randomUUID().toString(),
+    val sessionId: String,
+    val orderIndex: Int,
+    val startMs: Long,
+    val endMs: Long,
+    val clusterId: Int,
+    val speakerProfileId: String?,
+    val speakerLabel: String,
+    val badgeColorHex: String,
+    val text: String,
+    val languageCode: String? = null,
+    val clusterCentroid: FloatArray = FloatArray(0)
+) {
+    val clusterCentroidBlob: ByteArray
+        get() = SpeakerEmbeddingSerializer.floatArrayToBlob(clusterCentroid)
+}
+
+/**
+ * Represents a persistent speaker voiceprint profile stored in Room v5 (`speaker_profiles`).
+ */
+data class SpeakerProfileRecord(
+    val profileId: String,
+    val displayName: String,
+    val badgeColorHex: String,
+    val sampleCount: Int,
+    val centroidVector: FloatArray,
+    val createdAtMs: Long,
+    val updatedAtMs: Long
+)
+
+/**
+ * Storage contract bridging `SpeakerDiarizer` with Room v5 `speaker_profiles` & `speaker_profile_samples`.
+ */
+interface SpeakerProfileStore {
+    suspend fun getAllProfiles(): List<SpeakerProfileRecord>
+    suspend fun getProfileById(profileId: String): SpeakerProfileRecord?
+    suspend fun upsertProfile(profile: SpeakerProfileRecord, newSampleEmbedding: FloatArray, sourceSessionId: String?, durationMs: Long)
+    suspend fun updateSessionClusterProfile(
+        sessionId: String,
+        clusterId: Int,
+        speakerProfileId: String,
+        speakerLabel: String,
+        badgeColorHex: String
+    )
+}
+
+/**
+ * Utility for converting 192-dim Float32 CAM++ speaker embeddings to/from SQLite BLOBs (768 bytes).
+ */
+object SpeakerEmbeddingSerializer {
+    fun floatArrayToBlob(vector: FloatArray): ByteArray {
+        val buffer = ByteBuffer.allocate(vector.size * 4).order(ByteOrder.LITTLE_ENDIAN)
+        for (v in vector) buffer.putFloat(v)
+        return buffer.array()
+    }
+
+    fun blobToFloatArray(blob: ByteArray): FloatArray {
+        if (blob.isEmpty() || blob.size % 4 != 0) return FloatArray(0)
+        val buffer = ByteBuffer.wrap(blob).order(ByteOrder.LITTLE_ENDIAN)
+        return FloatArray(blob.size / 4) { buffer.float }
+    }
+
+    fun l2Normalize(vector: FloatArray): FloatArray {
+        if (vector.isEmpty()) return vector
+        var sumSq = 0f
+        for (v in vector) sumSq += v * v
+        val norm = sqrt(sumSq).coerceAtLeast(1e-8f)
+        return FloatArray(vector.size) { i -> vector[i] / norm }
+    }
+
+    fun cosineSimilarity(a: FloatArray, b: FloatArray): Float {
+        if (a.isEmpty() || a.size != b.size) return 0f
+        var dot = 0f
+        for (i in a.indices) dot += a[i] * b[i]
+        return dot
+    }
+}
+
+/**
+ * Upgraded on-device Speaker Diarization & Voiceprint Profile Identification engine.
+ *
+ * Fixes the >100 speakers over-segmentation issue on 3-speaker meetings by:
+ * 1. Replacing English-only `nemo_en_titanet_small.onnx` with bilingual `3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx` (192-dim CAM++).
+ * 2. Filtering out sub-second backchannel utterances (< 1.20s) from cluster centroid formation.
+ * 3. Tuning `FastClusteringConfig` (`threshold = 0.68f`) and supporting user speaker count hints (`Auto`, `2`, `3`, `4`, `5+`).
+ * 4. Running an iterative Post-Clustering Centroid Consolidation pass (`mergeCosineThreshold = 0.58f`, `maxAutoSpeakers = 8`).
+ * 5. Matching consolidated cluster centroids against enrolled voiceprint profiles via `SpeakerEmbeddingManager`.
+ */
+class SpeakerDiarizer(
+    private val context: Context,
+    private val profileStore: SpeakerProfileStore? = null
+) {
+    companion object {
+        private const val TAG = "SpeakerDiarizer"
+        private const val SAMPLE_RATE = 16000
+
+        // Asset/model paths
+        private const val PYANNOTE_INT8_ASSET = "sherpa-onnx-pyannote-segmentation-3-0/model.int8.onnx"
+        private const val PYANNOTE_FP32_ASSET = "sherpa-onnx-pyannote-segmentation-3-0/model.onnx"
+        private const val CAMPLUS_ZH_EN_ASSET = "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
+        private const val LEGACY_TITANET_ASSET = "nemo_en_titanet_small.onnx"
+
+        // Diarization hyper-parameters tuned for CAM++ (EN + TH + ZH)
+        private const val DEFAULT_CLUSTER_DISTANCE_THRESHOLD = 0.68f
+        private const val DEFAULT_CENTROID_MERGE_COSINE_THRESHOLD = 0.58f
+        private const val DEFAULT_PROFILE_MATCH_COSINE_THRESHOLD = 0.60f
+        private const val MIN_ANCHOR_TURN_DURATION_SEC = 1.20f
+        private const val MAX_MICRO_GAP_MERGE_SEC = 0.40f
+        private const val DEFAULT_MAX_AUTO_SPEAKERS = 8
+
+        val DEFAULT_BADGE_COLORS = listOf(
+            "#1D63B8", "#0D9488", "#D97706", "#7C3AED",
+            "#DC2626", "#059669", "#2563EB", "#DB2777"
+        )
+    }
+
+    data class DiarizationTurn(
+        val startMs: Long,
+        val endMs: Long,
+        val clusterId: Int,
+        val speakerProfileId: String?,
+        val speakerLabel: String,
+        val badgeColorHex: String,
+        val clusterCentroid: FloatArray
+    )
+
+    data class DiarizationResult(
+        val turns: List<DiarizationTurn>,
+        val segments: List<DiarizedTranscriptSegment>,
+        val formattedInlineTranscript: String,
+        val detectedSpeakerCount: Int
+    )
+
+    /**
+     * Runs the complete 5-stage diarization, consolidation, profile matching, and ASR chunk alignment
+     * pipeline against a recorded 16 kHz mono WAV file.
+     */
+    suspend fun diarizeWavAndAlign(
+        sessionId: String,
+        wavFile: File,
+        rawChunks: List<RawTranscriptChunk>,
+        expectedSpeakerCount: Int = -1,
+        maxAutoSpeakers: Int = DEFAULT_MAX_AUTO_SPEAKERS,
+        onProgress: ((Float) -> Unit)? = null
+    ): DiarizationResult = withContext(Dispatchers.Default) {
+        val samples = readWavFileToMonoFloat16k(wavFile)
+        if (samples.isEmpty()) {
+            Log.w(TAG, "WAV file ${wavFile.absolutePath} contained no readable PCM samples.")
+            val fallbackSegments = buildFallbackSegments(sessionId, rawChunks)
+            return@withContext DiarizationResult(
+                turns = emptyList(),
+                segments = fallbackSegments,
+                formattedInlineTranscript = formatInlineTranscript(fallbackSegments),
+                detectedSpeakerCount = if (fallbackSegments.isNotEmpty()) 1 else 0
+            )
+        }
+
+        val turns = diarizeSamples(
+            samples16kMono = samples,
+            expectedSpeakerCount = expectedSpeakerCount,
+            maxAutoSpeakers = maxAutoSpeakers,
+            onProgress = onProgress
+        )
+
+        val alignedSegments = alignTurnsWithTranscriptChunks(
+            sessionId = sessionId,
+            turns = turns,
+            rawChunks = rawChunks
+        )
+
+        val uniqueSpeakers = alignedSegments.map { it.clusterId }.distinct().size
+        DiarizationResult(
+            turns = turns,
+            segments = alignedSegments,
+            formattedInlineTranscript = formatInlineTranscript(alignedSegments),
+            detectedSpeakerCount = uniqueSpeakers
+        )
+    }
+
+    /**
+     * Executes the 5-stage constrained diarization and profile recognition pipeline on raw 16 kHz mono float samples.
+     */
+    suspend fun diarizeSamples(
+        samples16kMono: FloatArray,
+        expectedSpeakerCount: Int = -1,
+        clusterDistanceThreshold: Float = DEFAULT_CLUSTER_DISTANCE_THRESHOLD,
+        mergeCosineThreshold: Float = DEFAULT_CENTROID_MERGE_COSINE_THRESHOLD,
+        profileMatchThreshold: Float = DEFAULT_PROFILE_MATCH_COSINE_THRESHOLD,
+        maxAutoSpeakers: Int = DEFAULT_MAX_AUTO_SPEAKERS,
+        onProgress: ((Float) -> Unit)? = null
+    ): List<DiarizationTurn> = withContext(Dispatchers.Default) {
+        val segmentationPath = resolveModelFile(PYANNOTE_INT8_ASSET, PYANNOTE_FP32_ASSET)
+        val embeddingPath = resolveModelFile(CAMPLUS_ZH_EN_ASSET, LEGACY_TITANET_ASSET)
+
+        val extractorConfig = SpeakerEmbeddingExtractorConfig(
+            model = embeddingPath,
+            numThreads = 4,
+            debug = false,
+            provider = "cpu"
+        )
+
+        val sdConfig = OfflineSpeakerDiarizationConfig(
+            segmentation = OfflineSpeakerSegmentationModelConfig(
+                pyannote = OfflineSpeakerSegmentationPyannoteModelConfig(model = segmentationPath),
+                numThreads = 4,
+                debug = false,
+                provider = "cpu"
+            ),
+            embedding = extractorConfig,
+            clustering = FastClusteringConfig(
+                numClusters = if (expectedSpeakerCount > 0) expectedSpeakerCount else -1,
+                threshold = clusterDistanceThreshold
+            ),
+            minDurationOn = 0.45f,
+            minDurationOff = 0.45f
+        )
+
+        val diarizer = OfflineSpeakerDiarization(sdConfig)
+        val extractor = SpeakerEmbeddingExtractor(extractorConfig)
+        val embeddingDim = extractor.dim()
+        val embeddingManager = SpeakerEmbeddingManager(embeddingDim)
+
+        try {
+            // Load enrolled speaker profiles into SpeakerEmbeddingManager
+            val enrolledProfiles = profileStore?.getAllProfiles().orEmpty()
+            val profileMapById = enrolledProfiles.associateBy { it.profileId }
+            for (profile in enrolledProfiles) {
+                if (profile.centroidVector.size == embeddingDim) {
+                    embeddingManager.add(profile.profileId, profile.centroidVector)
+                }
+            }
+
+            // Stage 1: Run Pyannote + CAM++ diarization and merge micro-gaps (< 400ms)
+            val rawSegmentsArray = if (onProgress != null) {
+                diarizer.processWithCallback(samples16kMono) { numProcessed, numTotal ->
+                    if (numTotal > 0) {
+                        onProgress((numProcessed.toFloat() / numTotal.toFloat()).coerceIn(0f, 1f))
+                    }
+                    0 // Return 0 to continue processing
+                }
+            } else {
+                diarizer.process(samples16kMono)
+            }
+
+            val rawSegments = rawSegmentsArray.toList().sortedBy { it.start }
+            if (rawSegments.isEmpty()) return@withContext emptyList()
+
+            val mergedSegments = mergeMicroGaps(rawSegments, MAX_MICRO_GAP_MERGE_SEC)
+
+            // Stage 2 & 3: Separate Anchor Turns (>= 1.2s) from Short Turns (< 1.2s) and extract cluster centroids
+            val groupedByRawSpeaker = mergedSegments.groupBy { it.speaker }
+            val rawCentroids = mutableMapOf<Int, FloatArray>()
+            val totalDurationByCluster = mutableMapOf<Int, Float>()
+
+            for ((rawClusterId, turns) in groupedByRawSpeaker) {
+                val totalDur = turns.sumOf { (it.end - it.start).toDouble() }.toFloat()
+                totalDurationByCluster[rawClusterId] = totalDur
+
+                val anchorTurns = turns
+                    .filter { (it.end - it.start) >= MIN_ANCHOR_TURN_DURATION_SEC }
+                    .sortedByDescending { it.end - it.start }
+                    .take(5)
+
+                val selectedTurns = anchorTurns.ifEmpty {
+                    turns.sortedByDescending { it.end - it.start }.take(2)
+                }
+
+                val weightedSum = FloatArray(embeddingDim)
+                var hasValidEmbedding = false
+
+                for (turn in selectedTurns) {
+                    val startSample = (turn.start * SAMPLE_RATE).toInt().coerceIn(0, samples16kMono.size)
+                    val endSample = (turn.end * SAMPLE_RATE).toInt().coerceIn(startSample, samples16kMono.size)
+                    if (endSample - startSample < SAMPLE_RATE / 4) continue // Require at least 250ms
+
+                    val slice = samples16kMono.copyOfRange(startSample, endSample)
+                    val vec = extractNormalizedEmbedding(extractor, slice) ?: continue
+                    val weight = (turn.end - turn.start).coerceAtLeast(0.25f)
+                    for (i in 0 until embeddingDim) {
+                        weightedSum[i] += vec[i] * weight
+                    }
+                    hasValidEmbedding = true
+                }
+
+                if (hasValidEmbedding) {
+                    rawCentroids[rawClusterId] = SpeakerEmbeddingSerializer.l2Normalize(weightedSum)
+                }
+            }
+
+            // Stage 4: Post-Clustering Centroid Consolidation (eliminating the >100 speaker fragmentation)
+            val targetMaxClusters = if (expectedSpeakerCount > 0) expectedSpeakerCount else maxAutoSpeakers
+            val consolidated = consolidateClusterCentroids(
+                rawCentroids = rawCentroids,
+                totalDurationByCluster = totalDurationByCluster,
+                mergeCosineThreshold = mergeCosineThreshold,
+                maxClusters = targetMaxClusters
+            )
+
+            // Reassign any raw cluster that had only ultra-short turns and no valid centroid
+            val fullClusterRemap = consolidated.clusterRemap.toMutableMap()
+            for (rawClusterId in groupedByRawSpeaker.keys) {
+                if (!fullClusterRemap.containsKey(rawClusterId)) {
+                    val fallbackTarget = consolidated.canonicalCentroids.keys.firstOrNull() ?: 0
+                    fullClusterRemap[rawClusterId] = fallbackTarget
+                }
+            }
+
+            // Stage 5: Match consolidated centroids against enrolled Speaker Profiles
+            data class ResolvedSpeakerMeta(
+                val canonicalClusterId: Int,
+                val profileId: String?,
+                val displayName: String,
+                val badgeColorHex: String,
+                val centroid: FloatArray
+            )
+
+            val resolvedMetaByCluster = mutableMapOf<Int, ResolvedSpeakerMeta>()
+            val matchedClusterByProfileId = mutableMapOf<String, Int>()
+            var anonymousSpeakerIndex = 1
+
+            // Sort canonical clusters by first appearance in the meeting for natural Speaker 1, Speaker 2 numbering
+            val firstSeenOrder = mergedSegments
+                .map { fullClusterRemap[it.speaker] ?: it.speaker }
+                .distinct()
+
+            for (canonicalId in firstSeenOrder) {
+                val centroid = consolidated.canonicalCentroids[canonicalId] ?: FloatArray(embeddingDim)
+                val matchedProfileId = if (centroid.isNotEmpty() && enrolledProfiles.isNotEmpty()) {
+                    embeddingManager.search(centroid, profileMatchThreshold)
+                } else {
+                    ""
+                }
+
+                val matchedProfile = if (matchedProfileId.isNotEmpty()) profileMapById[matchedProfileId] else null
+                if (matchedProfile != null) {
+                    val existingCanonical = matchedClusterByProfileId[matchedProfile.profileId]
+                    if (existingCanonical != null) {
+                        // Two clusters matched the same enrolled person -> unify them
+                        fullClusterRemap.entries.forEach { entry ->
+                            if (entry.value == canonicalId) fullClusterRemap[entry.key] = existingCanonical
+                        }
+                        continue
+                    }
+                    matchedClusterByProfileId[matchedProfile.profileId] = canonicalId
+                    resolvedMetaByCluster[canonicalId] = ResolvedSpeakerMeta(
+                        canonicalClusterId = canonicalId,
+                        profileId = matchedProfile.profileId,
+                        displayName = matchedProfile.displayName,
+                        badgeColorHex = matchedProfile.badgeColorHex,
+                        centroid = centroid
+                    )
+                } else {
+                    val colorHex = DEFAULT_BADGE_COLORS[(anonymousSpeakerIndex - 1) % DEFAULT_BADGE_COLORS.size]
+                    resolvedMetaByCluster[canonicalId] = ResolvedSpeakerMeta(
+                        canonicalClusterId = canonicalId,
+                        profileId = null,
+                        displayName = "Speaker $anonymousSpeakerIndex",
+                        badgeColorHex = colorHex,
+                        centroid = centroid
+                    )
+                    anonymousSpeakerIndex++
+                }
+            }
+
+            // Convert segments and merge adjacent turns that now share the same consolidated canonical speaker
+            val preliminaryTurns = mergedSegments.map { seg ->
+                val canonicalId = fullClusterRemap[seg.speaker] ?: seg.speaker
+                val meta = resolvedMetaByCluster[canonicalId] ?: ResolvedSpeakerMeta(
+                    canonicalClusterId = canonicalId,
+                    profileId = null,
+                    displayName = "Speaker 1",
+                    badgeColorHex = DEFAULT_BADGE_COLORS[0],
+                    centroid = FloatArray(embeddingDim)
+                )
+                DiarizationTurn(
+                    startMs = (seg.start * 1000f).toLong(),
+                    endMs = (seg.end * 1000f).toLong(),
+                    clusterId = meta.canonicalClusterId,
+                    speakerProfileId = meta.profileId,
+                    speakerLabel = meta.displayName,
+                    badgeColorHex = meta.badgeColorHex,
+                    clusterCentroid = meta.centroid
+                )
+            }
+
+            return@withContext mergeAdjacentConsolidatedTurns(preliminaryTurns, maxGapMs = 600L)
+        } finally {
+            embeddingManager.release()
+            extractor.release()
+            diarizer.release()
+        }
+    }
+
+    /**
+     * Enrolls a new speaker profile or updates an existing profile using the 192-dim CAM++ cluster centroid
+     * from a meeting transcript block, then updates all matching segments in the session.
+     */
+    suspend fun enrollOrUpdateSpeakerProfile(
+        sessionId: String,
+        clusterId: Int,
+        clusterCentroid: FloatArray,
+        displayName: String,
+        existingProfileId: String? = null,
+        badgeColorHex: String? = null,
+        sampleDurationMs: Long = 4000L
+    ): SpeakerProfileRecord = withContext(Dispatchers.IO) {
+        val normalizedSample = SpeakerEmbeddingSerializer.l2Normalize(clusterCentroid)
+        val now = System.currentTimeMillis()
+        val store = profileStore
+
+        val existing = existingProfileId?.let { store?.getProfileById(it) }
+        val updatedProfile = if (existing != null && existing.centroidVector.size == normalizedSample.size) {
+            // Running L2-normalized mean across historical samples + new sample
+            val n = existing.sampleCount.coerceAtLeast(1)
+            val combined = FloatArray(normalizedSample.size) { i ->
+                (existing.centroidVector[i] * n + normalizedSample[i]) / (n + 1).toFloat()
+            }
+            existing.copy(
+                displayName = displayName.trim().ifEmpty { existing.displayName },
+                badgeColorHex = badgeColorHex ?: existing.badgeColorHex,
+                sampleCount = n + 1,
+                centroidVector = SpeakerEmbeddingSerializer.l2Normalize(combined),
+                updatedAtMs = now
+            )
+        } else {
+            val color = badgeColorHex ?: DEFAULT_BADGE_COLORS[abs(displayName.hashCode()) % DEFAULT_BADGE_COLORS.size]
+            SpeakerProfileRecord(
+                profileId = existingProfileId ?: UUID.randomUUID().toString(),
+                displayName = displayName.trim().ifEmpty { "Speaker" },
+                badgeColorHex = color,
+                sampleCount = 1,
+                centroidVector = normalizedSample,
+                createdAtMs = now,
+                updatedAtMs = now
+            )
+        }
+
+        store?.upsertProfile(
+            profile = updatedProfile,
+            newSampleEmbedding = normalizedSample,
+            sourceSessionId = sessionId,
+            durationMs = sampleDurationMs
+        )
+        store?.updateSessionClusterProfile(
+            sessionId = sessionId,
+            clusterId = clusterId,
+            speakerProfileId = updatedProfile.profileId,
+            speakerLabel = updatedProfile.displayName,
+            badgeColorHex = updatedProfile.badgeColorHex
+        )
+
+        updatedProfile
+    }
+
+    /**
+     * Aligns timestamped ASR transcript chunks with consolidated speaker diarization turns by temporal overlap,
+     * merging consecutive chunks spoken by the same speaker within 1.5s into readable paragraph blocks.
+     */
+    fun alignTurnsWithTranscriptChunks(
+        sessionId: String,
+        turns: List<DiarizationTurn>,
+        rawChunks: List<RawTranscriptChunk>
+    ): List<DiarizedTranscriptSegment> {
+        val validChunks = rawChunks.filter { it.text.isNotBlank() }.sortedBy { it.startMs }
+        if (validChunks.isEmpty()) return emptyList()
+        if (turns.isEmpty()) return buildFallbackSegments(sessionId, validChunks)
+
+        val attributedBlocks = mutableListOf<DiarizedTranscriptSegment>()
+
+        for (chunk in validChunks) {
+            // Find the diarization turn with maximum overlap, or nearest temporal boundary
+            var bestTurn: DiarizationTurn? = null
+            var maxOverlapMs = 0L
+
+            for (turn in turns) {
+                val overlapStart = max(chunk.startMs, turn.startMs)
+                val overlapEnd = min(chunk.endMs, turn.endMs)
+                val overlap = (overlapEnd - overlapStart).coerceAtLeast(0L)
+                if (overlap > maxOverlapMs) {
+                    maxOverlapMs = overlap
+                    bestTurn = turn
+                }
+            }
+
+            val chosenTurn = bestTurn ?: turns.minByOrNull { turn ->
+                val chunkMid = (chunk.startMs + chunk.endMs) / 2
+                val turnMid = (turn.startMs + turn.endMs) / 2
+                abs(chunkMid - turnMid)
+            } ?: turns.first()
+
+            val previous = attributedBlocks.lastOrNull()
+            // Group consecutive chunks from the same speaker separated by <= 1.5s into one cohesive block
+            // (capped at 25 seconds per block so playback highlighting stays granular and easy to follow)
+            val canMergeWithPrevious = previous != null &&
+                previous.clusterId == chosenTurn.clusterId &&
+                (chunk.startMs - previous.endMs) <= 1500L &&
+                (chunk.endMs - previous.startMs) <= 25_000L
+
+            if (canMergeWithPrevious && previous != null) {
+                val separator = if (needsSpaceBetween(previous.text, chunk.text)) " " else ""
+                attributedBlocks[attributedBlocks.lastIndex] = previous.copy(
+                    endMs = max(previous.endMs, chunk.endMs),
+                    text = previous.text + separator + chunk.text.trim()
+                )
+            } else {
+                attributedBlocks.add(
+                    DiarizedTranscriptSegment(
+                        sessionId = sessionId,
+                        orderIndex = attributedBlocks.size,
+                        startMs = chunk.startMs,
+                        endMs = max(chunk.endMs, chunk.startMs + 500L),
+                        clusterId = chosenTurn.clusterId,
+                        speakerProfileId = chosenTurn.speakerProfileId,
+                        speakerLabel = chosenTurn.speakerLabel,
+                        badgeColorHex = chosenTurn.badgeColorHex,
+                        text = chunk.text.trim(),
+                        languageCode = chunk.languageCode,
+                        clusterCentroid = chosenTurn.clusterCentroid
+                    )
+                )
+            }
+        }
+
+        return attributedBlocks.mapIndexed { idx, seg -> seg.copy(orderIndex = idx) }
+    }
+
+    fun formatInlineTranscript(segments: List<DiarizedTranscriptSegment>): String {
+        return segments.joinToString(separator = "\n\n") { seg ->
+            val mm = (seg.startMs / 1000) / 60
+            val ss = (seg.startMs / 1000) % 60
+            String.format("[%02d:%02d] %s: %s", mm, ss, seg.speakerLabel, seg.text)
+        }
+    }
+
+    private fun buildFallbackSegments(
+        sessionId: String,
+        rawChunks: List<RawTranscriptChunk>
+    ): List<DiarizedTranscriptSegment> {
+        return rawChunks.filter { it.text.isNotBlank() }.mapIndexed { index, chunk ->
+            DiarizedTranscriptSegment(
+                sessionId = sessionId,
+                orderIndex = index,
+                startMs = chunk.startMs,
+                endMs = max(chunk.endMs, chunk.startMs + 500L),
+                clusterId = 0,
+                speakerProfileId = null,
+                speakerLabel = "Speaker 1",
+                badgeColorHex = DEFAULT_BADGE_COLORS[0],
+                text = chunk.text.trim(),
+                languageCode = chunk.languageCode
+            )
+        }
+    }
+
+    private fun extractNormalizedEmbedding(
+        extractor: SpeakerEmbeddingExtractor,
+        samples16kMono: FloatArray
+    ): FloatArray? {
+        val stream = extractor.createStream()
+        return try {
+            stream.acceptWaveform(samples16kMono, SAMPLE_RATE)
+            stream.inputFinished()
+            if (extractor.isReady(stream)) {
+                val raw = extractor.compute(stream)
+                SpeakerEmbeddingSerializer.l2Normalize(raw)
+            } else {
+                null
+            }
+        } finally {
+            stream.release()
+        }
+    }
+
+    private data class ConsolidationResult(
+        val clusterRemap: Map<Int, Int>,
+        val canonicalCentroids: Map<Int, FloatArray>
+    )
+
+    /**
+     * Agglomeratively merges over-segmented clusters whose duration-weighted centroids exceed
+     * `mergeCosineThreshold` or when the total cluster count exceeds `maxClusters`.
+     */
+    private fun consolidateClusterCentroids(
+        rawCentroids: Map<Int, FloatArray>,
+        totalDurationByCluster: Map<Int, Float>,
+        mergeCosineThreshold: Float,
+        maxClusters: Int
+    ): ConsolidationResult {
+        if (rawCentroids.isEmpty()) {
+            return ConsolidationResult(emptyMap(), emptyMap())
+        }
+
+        val activeCentroids = rawCentroids.toMutableMap()
+        val activeWeights = totalDurationByCluster.toMutableMap()
+        val parentMap = rawCentroids.keys.associateWith { it }.toMutableMap()
+
+        fun findRoot(id: Int): Int {
+            var curr = id
+            while (parentMap[curr] != null && parentMap[curr] != curr) {
+                curr = parentMap[curr]!!
+            }
+            return curr
+        }
+
+        while (activeCentroids.size > 1) {
+            val keys = activeCentroids.keys.toList()
+            var bestPair: Pair<Int, Int>? = null
+            var bestSim = -1f
+
+            for (i in keys.indices) {
+                for (j in i + 1 until keys.size) {
+                    val idA = keys[i]
+                    val idB = keys[j]
+                    val sim = SpeakerEmbeddingSerializer.cosineSimilarity(
+                        activeCentroids[idA]!!,
+                        activeCentroids[idB]!!
+                    )
+                    if (sim > bestSim) {
+                        bestSim = sim
+                        bestPair = idA to idB
+                    }
+                }
+            }
+
+            val shouldMerge = bestPair != null && (
+                bestSim >= mergeCosineThreshold || activeCentroids.size > maxClusters
+            )
+            if (!shouldMerge || bestPair == null) break
+
+            val (firstId, secondId) = bestPair
+            val weightA = activeWeights[firstId] ?: 1f
+            val weightB = activeWeights[secondId] ?: 1f
+
+            // Keep the dominant speaker cluster ID as the canonical cluster root
+            val (keepId, absorbId) = if (weightA >= weightB) firstId to secondId else secondId to firstId
+            val vecKeep = activeCentroids[keepId]!!
+            val vecAbsorb = activeCentroids[absorbId]!!
+            val wKeep = activeWeights[keepId] ?: 1f
+            val wAbsorb = activeWeights[absorbId] ?: 1f
+
+            val mergedVec = FloatArray(vecKeep.size) { idx ->
+                vecKeep[idx] * wKeep + vecAbsorb[idx] * wAbsorb
+            }
+            activeCentroids[keepId] = SpeakerEmbeddingSerializer.l2Normalize(mergedVec)
+            activeWeights[keepId] = wKeep + wAbsorb
+
+            activeCentroids.remove(absorbId)
+            activeWeights.remove(absorbId)
+            parentMap[absorbId] = keepId
+        }
+
+        val finalRemap = rawCentroids.keys.associateWith { findRoot(it) }
+        return ConsolidationResult(
+            clusterRemap = finalRemap,
+            canonicalCentroids = activeCentroids
+        )
+    }
+
+    private fun mergeMicroGaps(
+        segments: List<OfflineSpeakerDiarizationSegment>,
+        maxGapSec: Float
+    ): List<OfflineSpeakerDiarizationSegment> {
+        if (segments.isEmpty()) return emptyList()
+        val merged = mutableListOf<OfflineSpeakerDiarizationSegment>()
+        var current = segments.first()
+
+        for (i in 1 until segments.size) {
+            val next = segments[i]
+            if (next.speaker == current.speaker && (next.start - current.end) <= maxGapSec) {
+                current = OfflineSpeakerDiarizationSegment(
+                    start = current.start,
+                    end = max(current.end, next.end),
+                    speaker = current.speaker
+                )
+            } else {
+                merged.add(current)
+                current = next
+            }
+        }
+        merged.add(current)
+        return merged
+    }
+
+    private fun mergeAdjacentConsolidatedTurns(
+        turns: List<DiarizationTurn>,
+        maxGapMs: Long
+    ): List<DiarizationTurn> {
+        if (turns.isEmpty()) return emptyList()
+        val merged = mutableListOf<DiarizationTurn>()
+        var current = turns.first()
+
+        for (i in 1 until turns.size) {
+            val next = turns[i]
+            if (next.clusterId == current.clusterId && (next.startMs - current.endMs) <= maxGapMs) {
+                current = current.copy(endMs = max(current.endMs, next.endMs))
+            } else {
+                merged.add(current)
+                current = next
+            }
+        }
+        merged.add(current)
+        return merged
+    }
+
+    /**
+     * Resolves an ONNX model path on disk (checking downloaded models dir first, then extracting from APK assets).
+     */
+    private fun resolveModelFile(primaryRelativePath: String, fallbackRelativePath: String): String {
+        val modelsRoot = File(context.filesDir, "models")
+        val downloadedPrimary = File(modelsRoot, primaryRelativePath)
+        if (downloadedPrimary.exists() && downloadedPrimary.length() > 0L) {
+            return downloadedPrimary.absolutePath
+        }
+
+        val cachedPrimary = extractAssetIfPresent(primaryRelativePath)
+        if (cachedPrimary != null) return cachedPrimary.absolutePath
+
+        val downloadedFallback = File(modelsRoot, fallbackRelativePath)
+        if (downloadedFallback.exists() && downloadedFallback.length() > 0L) {
+            return downloadedFallback.absolutePath
+        }
+
+        val cachedFallback = extractAssetIfPresent(fallbackRelativePath)
+        if (cachedFallback != null) return cachedFallback.absolutePath
+
+        return downloadedPrimary.absolutePath
+    }
+
+    private fun extractAssetIfPresent(assetPath: String): File? {
+        return try {
+            val outFile = File(context.filesDir, "bundled_models/$assetPath")
+            if (outFile.exists() && outFile.length() > 0L) return outFile
+            outFile.parentFile?.mkdirs()
+            context.assets.open(assetPath).use { input ->
+                FileOutputStream(outFile).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            outFile
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Reads a 16 kHz 16-bit mono PCM WAV file into a normalized FloatArray in [-1.0f, 1.0f].
+     */
+    private fun readWavFileToMonoFloat16k(wavFile: File): FloatArray {
+        if (!wavFile.exists() || wavFile.length() <= 44L) return FloatArray(0)
+        return try {
+            RandomAccessFile(wavFile, "r").use { raf ->
+                // Locate the "data" subchunk dynamically in case extra RIFF metadata chunks exist
+                var dataOffset = 44L
+                var dataSize = (raf.length() - 44L).toInt()
+                raf.seek(12L)
+                val headerBuf = ByteArray(8)
+                while (raf.filePointer + 8 <= raf.length()) {
+                    raf.readFully(headerBuf)
+                    val chunkId = String(headerBuf, 0, 4, Charsets.US_ASCII)
+                    val chunkLen = ByteBuffer.wrap(headerBuf, 4, 4).order(ByteOrder.LITTLE_ENDIAN).int
+                    if (chunkId == "data") {
+                        dataOffset = raf.filePointer
+                        dataSize = min(chunkLen.toLong(), raf.length() - dataOffset).toInt()
+                        break
+                    } else {
+                        val skipBytes = if (chunkLen % 2 == 1) chunkLen + 1L else chunkLen.toLong()
+                        raf.seek(raf.filePointer + skipBytes)
+                    }
+                }
+
+                raf.seek(dataOffset)
+                val numSamples = dataSize / 2
+                val floatSamples = FloatArray(numSamples)
+                val byteChunk = ByteArray(32768)
+                var sampleIndex = 0
+                var bytesRemaining = dataSize
+
+                while (bytesRemaining > 0 && sampleIndex < numSamples) {
+                    val toRead = min(byteChunk.size, bytesRemaining)
+                    val read = raf.read(byteChunk, 0, toRead)
+                    if (read <= 0) break
+                    val shortCount = read / 2
+                    val shortBuf = ByteBuffer.wrap(byteChunk, 0, shortCount * 2)
+                        .order(ByteOrder.LITTLE_ENDIAN)
+                        .asShortBuffer()
+                    for (i in 0 until shortCount) {
+                        if (sampleIndex < numSamples) {
+                            floatSamples[sampleIndex++] = (shortBuf.get(i) / 32768.0f).coerceIn(-1.0f, 1.0f)
+                        }
+                    }
+                    bytesRemaining -= read
+                }
+                floatSamples
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to read WAV file ${wavFile.absolutePath}", e)
+            FloatArray(0)
+        }
+    }
+
+    private fun needsSpaceBetween(left: String, right: String): Boolean {
+        if (left.isEmpty() || right.isEmpty()) return false
+        val lastChar = left.last()
+        val firstChar = right.first()
+        // Thai (\u0E00-\u0E7F) and CJK (\u4E00-\u9FFF) characters do not require spaces between contiguous phrases
+        val isLeftCjkOrThai = lastChar in '\u0E00'..'\u0E7F' || lastChar in '\u4E00'..'\u9FFF'
+        val isRightCjkOrThai = firstChar in '\u0E00'..'\u0E7F' || firstChar in '\u4E00'..'\u9FFF'
+        return !(isLeftCjkOrThai && isRightCjkOrThai)
+    }
+}

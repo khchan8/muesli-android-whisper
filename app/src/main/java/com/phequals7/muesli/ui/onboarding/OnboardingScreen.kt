@@ -27,7 +27,7 @@ import com.phequals7.muesli.data.SharedStore
 import com.phequals7.muesli.data.entity.DictationResult
 import com.phequals7.muesli.engine.SherpaOnnxEngine
 import com.phequals7.muesli.model.ModelManager
-import com.phequals7.muesli.model.SpeechModel
+import com.phequals7.muesli.model.SpeechModelSpec
 import com.phequals7.muesli.model.SpeechModels
 import com.phequals7.muesli.summaries.ChatGptAuthManager
 import com.phequals7.muesli.theme.MuesliCorners
@@ -279,37 +279,40 @@ private fun ModelStep(
     val colors = MuesliTheme.colors
     val scope = rememberCoroutineScope()
 
-    // Fresh installs (no stored selection, nothing downloaded) preselect
-    // the 110M — it runs well on low-end chips, as does iOS's default.
-    // Existing installs keep whatever they already have.
+    // Fresh installs (no stored selection, nothing downloaded) preselect the
+    // v2 default Qwen3-ASR 0.6B (trilingual EN/TH/ZH). Existing installs keep
+    // whatever they already have.
     var selected by remember {
         mutableStateOf(
             if (store.selectedModelId.isBlank() &&
-                SpeechModels.all.none { ModelManager(context.applicationContext, it).isDownloaded() }
-            ) SpeechModels.PARAKEET_110M
+                SpeechModels.selectableAsrModels.none {
+                    ModelManager.getInstance(context.applicationContext).isDownloaded(it)
+                }
+            ) SpeechModels.QWEN3_ASR_0_6B_INT8
             else SpeechModels.byId(store.selectedModelId)
         )
     }
-    val manager = remember(selected.id) { ModelManager(context.applicationContext, selected) }
-    var downloaded by remember(selected.id) { mutableStateOf(manager.isDownloaded()) }
-    var downloading by remember(selected.id) { mutableStateOf(false) }
-    var progress by remember(selected.id) { mutableStateOf<ModelManager.DownloadProgress?>(null) }
-    var error by remember(selected.id) { mutableStateOf<String?>(null) }
-    var downloadJob by remember(selected.id) { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    val manager = remember { ModelManager.getInstance(context.applicationContext) }
+    val statuses by manager.statuses.collectAsState()
+    val status = statuses[selected.id]
+    val downloaded = status?.isInstalled == true
+    val downloading = status?.isDownloading == true || status?.isExtracting == true
+    val progress = status?.progress ?: 0f
+    var error by remember { mutableStateOf<String?>(null) }
 
     OnboardingPage(
         step = OnboardingStep.MODEL, stepIndex = stepIndex, stepCount = stepCount,
-        subtitle = "Pick the on-device model that transcribes your voice. The recommended one runs well on any phone; the larger model is more accurate but needs a fast chip. Downloads once, runs fully offline.",
+        subtitle = "Pick the on-device model that transcribes your voice. The recommended one handles English, Thai, and Chinese in one model; downloads once, runs fully offline.",
         onBack = onBack,
         primaryLabel = "Continue",
         primaryEnabled = downloaded,
         onPrimary = onNext,
     ) {
         OnboardingCard {
-            SpeechModels.all.forEach { model: SpeechModel ->
+            SpeechModels.selectableAsrModels.forEach { model: SpeechModelSpec ->
                 OnboardingChoiceRow(
-                    title = if (model == SpeechModels.PARAKEET_110M) "${model.displayName} · recommended" else model.displayName,
-                    subtitle = "${model.capabilityLabel} · ${manager.formatBytes(model.totalSizeBytes)}",
+                    title = if (model == SpeechModels.QWEN3_ASR_0_6B_INT8) "${model.title} · recommended" else model.title,
+                    subtitle = "${model.capabilityLabel} · ~${model.approxDownloadSizeMb} MB",
                     selected = model.id == selected.id,
                     onClick = {
                         selected = model
@@ -323,18 +326,18 @@ private fun ModelStep(
             Text(
                 when {
                     downloaded -> "${selected.shortName} is ready"
-                    downloading && progress?.extracting == true -> "Extracting…"
-                    downloading && progress != null ->
-                        "${(progress!!.fraction * 100).toInt()}% · ${manager.formatBytes(progress!!.totalBytesDone)} of ${manager.formatBytes(progress!!.totalBytes)}"
+                    status?.isExtracting == true -> "Extracting…"
+                    downloading && status != null && status.totalBytes > 0 ->
+                        "${(progress * 100).toInt()}% · ${manager.formatBytes(status.downloadedBytes)} of ${manager.formatBytes(status.totalBytes)}"
                     else -> "${selected.shortName} needs a one-time download"
                 },
                 color = if (downloaded) colors.syncGreen else colors.textPrimary,
                 fontSize = 13.sp,
                 fontWeight = FontWeight.SemiBold,
             )
-            if (downloading && progress != null) {
+            if (downloading) {
                 LinearProgressIndicator(
-                    progress = { progress!!.fraction },
+                    progress = { progress.coerceIn(0f, 1f) },
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(4.dp)
@@ -346,39 +349,20 @@ private fun ModelStep(
             error?.let { Text(it, color = colors.destructive, fontSize = 11.sp) }
             if (!downloaded) {
                 if (downloading) {
-                    TextButton(onClick = {
-                        downloadJob?.cancel()
-                        downloading = false
-                        progress = null
-                    }) {
+                    TextButton(onClick = { manager.cancelDownload(selected.id) }) {
                         Text("Cancel download", color = colors.textSecondary)
                     }
                 } else {
                     Button(
                         onClick = {
                             error = null
-                            downloading = true
-                            downloadJob = scope.launch {
-                                try {
-                                    manager.download { p -> progress = p }
-                                    downloaded = true
-                                } catch (e: kotlinx.coroutines.CancellationException) {
-                                    throw e
-                                } catch (t: Throwable) {
-                                    error = "Download failed: ${t.message}"
-                                } finally {
-                                    downloading = false
-                                }
-                            }
+                            manager.downloadModel(selected)
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = colors.accent),
                         shape = RoundedCornerShape(MuesliCorners.medium),
                         modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Text(
-                            if (manager.downloadedBytes() > 0) "Resume download" else "Download ${selected.shortName}",
-                            fontSize = 14.sp,
-                        )
+                        Text("Download ${selected.shortName}", fontSize = 14.sp)
                     }
                 }
             }

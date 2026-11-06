@@ -31,15 +31,27 @@ object MeetingRecordingController {
         private set
     var liveTranscript by mutableStateOf("")
         private set
+    /** Diarization pass progress 0..1 while [isFinalizing]. */
+    var diarizationProgress by mutableFloatStateOf(0f)
+        private set
+    /** Speaker count hint for constrained clustering: -1 = Auto, or 2/3/4/5. */
+    var expectedSpeakerCount by mutableIntStateOf(-1)
 
     val isActive: Boolean get() = isRecording || isFinalizing
 
-    fun start(context: Context, sessionId: String, title: String, templateId: String) {
+    fun start(
+        context: Context,
+        sessionId: String,
+        title: String,
+        templateId: String,
+        expectedSpeakers: Int = expectedSpeakerCount
+    ) {
         val intent = Intent(context, MeetingRecorderService::class.java)
             .setAction(MeetingRecorderService.ACTION_START)
             .putExtra(MeetingRecorderService.EXTRA_SESSION_ID, sessionId)
             .putExtra(MeetingRecorderService.EXTRA_TITLE, title)
             .putExtra(MeetingRecorderService.EXTRA_TEMPLATE_ID, templateId)
+            .putExtra(MeetingRecorderService.EXTRA_EXPECTED_SPEAKERS, expectedSpeakers)
         context.startForegroundService(intent)
     }
 
@@ -65,6 +77,8 @@ object MeetingRecordingController {
         isRecording = true
         isFinalizing = false
         elapsedSeconds = 0
+
+        diarizationProgress = 0f
         inputLevel = 0f
         partialText = ""
         liveTranscript = ""
@@ -83,12 +97,17 @@ object MeetingRecordingController {
         inputLevel = 0f
     }
 
+    fun onDiarizationProgress(progress: Float) {
+        diarizationProgress = progress
+    }
+
     fun onFinished() {
         isRecording = false
         isFinalizing = false
         activeSessionId = null
         meetingTitle = ""
         elapsedSeconds = 0
+        diarizationProgress = 0f
         inputLevel = 0f
         partialText = ""
         liveTranscript = ""

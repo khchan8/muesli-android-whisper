@@ -32,7 +32,7 @@ import com.phequals7.muesli.data.entity.CustomWord
 import com.phequals7.muesli.meetings.MeetingTemplate
 import com.phequals7.muesli.model.ModelManager
 import com.phequals7.muesli.bubble.BubbleService
-import com.phequals7.muesli.model.SpeechModel
+import com.phequals7.muesli.model.SpeechModelSpec
 import com.phequals7.muesli.model.SpeechModels
 import com.phequals7.muesli.engine.SherpaRecognizerHolder
 import com.phequals7.muesli.summaries.ChatGptAuthManager
@@ -526,7 +526,13 @@ private fun ModelsSettings(store: SharedStore) {
     var selectedId by remember { mutableStateOf(SpeechModels.byId(store.selectedModelId).id) }
 
     Column(verticalArrangement = Arrangement.spacedBy(MuesliSpacing.s16)) {
-        SpeechModels.all.forEach { model ->
+        Text(
+            "Multilingual (EN + TH + ZH + YUE)",
+            color = colors.textSecondary,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        SpeechModels.selectableAsrModels.forEach { model ->
             SpeechModelCard(
                 model = model,
                 selected = model.id == selectedId,
@@ -537,10 +543,21 @@ private fun ModelsSettings(store: SharedStore) {
                 },
             )
         }
+
+        Text(
+            "Speaker Diarization (auto-installed with multilingual models)",
+            color = colors.textSecondary,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        SpeechModels.diarizationModels.forEach { model ->
+            SpeechModelCard(model = model, selected = false, onSelect = {})
+        }
+
         SettingsCard {
             Text("About on-device models", color = colors.textPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
             Text(
-                "All models run fully on-device via sherpa-onnx — audio never leaves this phone. The selected model is used for voice notes, the keyboard, and meetings.",
+                "All models run fully on-device via sherpa-onnx — audio never leaves this phone. The selected model is used for voice notes, the keyboard, and meetings. Legacy Parakeet models are European/English-only.",
                 color = colors.textSecondary,
                 fontSize = 12.sp,
                 lineHeight = 17.sp
@@ -801,7 +818,7 @@ private fun AboutSettings(store: SharedStore) {
             }
             Row(modifier = Modifier.fillMaxWidth()) {
                 Text("Model", color = colors.textSecondary, fontSize = 13.sp, modifier = Modifier.weight(1f))
-                Text(SpeechModels.selected(context).displayName, color = colors.textPrimary, fontSize = 13.sp)
+                Text(SpeechModels.selected(context).title, color = colors.textPrimary, fontSize = 13.sp)
             }
         }
 
@@ -825,20 +842,20 @@ private fun AboutSettings(store: SharedStore) {
  */
 @Composable
 internal fun SpeechModelCard(
-    model: SpeechModel,
+    model: SpeechModelSpec,
     selected: Boolean,
     onSelect: () -> Unit,
 ) {
     val colors = MuesliTheme.colors
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val modelManager = remember(model.id) { ModelManager(context.applicationContext, model) }
+    val manager = remember { ModelManager.getInstance(context.applicationContext) }
+    val statuses by manager.statuses.collectAsState()
+    val status = statuses[model.id]
 
-    var isDownloaded by remember(model.id) { mutableStateOf(modelManager.isDownloaded()) }
-    var isDownloading by remember(model.id) { mutableStateOf(false) }
-    var progress by remember(model.id) { mutableStateOf<ModelManager.DownloadProgress?>(null) }
-    var statusMessage by remember(model.id) { mutableStateOf<String?>(null) }
-    var downloadJob by remember(model.id) { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    val isDownloaded = status?.isInstalled == true
+    val isDownloading = status?.isDownloading == true || status?.isExtracting == true
+    val progress = status?.progress ?: 0f
 
     MuesliSurfaceCard {
         Column(
@@ -878,17 +895,15 @@ internal fun SpeechModelCard(
                     )
                 }
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(model.displayName, color = colors.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Text(model.title, color = colors.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                     Text(model.capabilityLabel, color = colors.accent, fontSize = 10.sp, fontWeight = FontWeight.Medium)
                     Text(
                         text = when {
-                            isDownloading && progress?.extracting == true -> "Extracting ${progress!!.currentFile}…"
-                            isDownloading && progress != null ->
-                                "${(progress!!.fraction * 100).toInt()}% · ${modelManager.formatBytes(progress!!.totalBytesDone)} of ${modelManager.formatBytes(progress!!.totalBytes)}"
-                            isDownloaded -> "Downloaded · ${modelManager.formatBytes(modelManager.downloadedBytes())} on disk"
-                            modelManager.downloadedBytes() > 0 ->
-                                "Partially downloaded · ${modelManager.formatBytes(modelManager.downloadedBytes())} / ${modelManager.formatBytes(model.totalSizeBytes)}"
-                            else -> "Not downloaded · ${modelManager.formatBytes(model.totalSizeBytes)} required"
+                            status?.isExtracting == true -> "Extracting…"
+                            isDownloading && status != null && status.totalBytes > 0 ->
+                                "${(progress * 100).toInt()}% · ${manager.formatBytes(status.downloadedBytes)} of ${manager.formatBytes(status.totalBytes)}"
+                            isDownloaded -> "Downloaded · ${manager.formatBytes(status?.diskUsageBytes ?: model.totalSizeBytes)} on disk"
+                            else -> "Not downloaded · ~${model.approxDownloadSizeMb} MB · ~${model.approxRamFootprintMb} MB RAM"
                         },
                         color = colors.textSecondary,
                         fontSize = 10.sp
@@ -896,75 +911,50 @@ internal fun SpeechModelCard(
                 }
             }
 
-            Text(model.detail, color = colors.textSecondary, fontSize = 11.sp, lineHeight = 15.sp)
+            Text(model.subtitle, color = colors.textSecondary, fontSize = 11.sp, lineHeight = 15.sp)
 
-            if (isDownloading && progress != null) {
+            if (isDownloading) {
                 LinearProgressIndicator(
-                    progress = { progress!!.fraction },
+                    progress = { progress.coerceIn(0f, 1f) },
                     modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(MuesliCorners.small)),
                     color = colors.accent,
                     trackColor = colors.surfacePrimary,
                 )
             }
 
-            statusMessage?.let {
+            status?.errorMessage?.let {
                 Text(it, color = colors.destructive, fontSize = 11.sp)
             }
 
             Row(horizontalArrangement = Arrangement.spacedBy(MuesliSpacing.s8)) {
                 if (isDownloading) {
-                    TextButton(onClick = {
-                        downloadJob?.cancel()
-                        downloadJob = null
-                        isDownloading = false
-                        progress = null
-                    }) {
+                    TextButton(onClick = { manager.cancelDownload(model.id) }) {
                         Text("Cancel", color = colors.textSecondary)
                     }
                 } else if (!isDownloaded) {
                     Button(
-                        onClick = {
-                            statusMessage = null
-                            isDownloading = true
-                            downloadJob = scope.launch {
-                                try {
-                                    modelManager.download { p -> progress = p }
-                                    isDownloaded = true
-                                    statusMessage = null
-                                } catch (e: kotlinx.coroutines.CancellationException) {
-                                    throw e
-                                } catch (t: Throwable) {
-                                    statusMessage = "Download failed: ${t.message}"
-                                } finally {
-                                    isDownloading = false
-                                }
-                            }
-                        },
+                        onClick = { manager.downloadModel(model) },
                         colors = ButtonDefaults.buttonColors(containerColor = colors.accent),
                         shape = RoundedCornerShape(MuesliCorners.medium)
                     ) {
-                        Text(
-                            if (modelManager.downloadedBytes() > 0) "Resume Download" else "Download",
-                            fontSize = 13.sp
-                        )
+                        Text("Download", fontSize = 13.sp)
                     }
                 } else {
-                    if (!selected) {
-                        Button(
-                            onClick = onSelect,
-                            colors = ButtonDefaults.buttonColors(containerColor = colors.accent),
-                            shape = RoundedCornerShape(MuesliCorners.medium)
-                        ) {
-                            Text("Use This Model", fontSize = 13.sp)
+                    if (model.asrModelType != null) {
+                        if (!selected) {
+                            Button(
+                                onClick = onSelect,
+                                colors = ButtonDefaults.buttonColors(containerColor = colors.accent),
+                                shape = RoundedCornerShape(MuesliCorners.medium)
+                            ) {
+                                Text("Use This Model", fontSize = 13.sp)
+                            }
+                        } else {
+                            Text("Active", color = colors.accent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(horizontal = MuesliSpacing.s8, vertical = MuesliSpacing.s8))
                         }
-                    } else {
-                        Text("Active", color = colors.accent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.padding(horizontal = MuesliSpacing.s8, vertical = MuesliSpacing.s8))
                     }
-                    TextButton(onClick = {
-                        modelManager.deleteModel()
-                        isDownloaded = false
-                    }) {
+                    TextButton(onClick = { scope.launch { manager.deleteModel(model) } }) {
                         Text("Delete", color = colors.destructive)
                     }
                 }

@@ -36,7 +36,7 @@ class QuickCaptureTileService : TileService() {
             )
             return
         }
-        if (!ModelManager(this).isDownloaded()) {
+        if (!ModelManager.getInstance(this).isDownloaded()) {
             startActivityAndCollapse(
                 Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             )

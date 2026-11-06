@@ -69,8 +69,10 @@ fun MeetingsTab(
     var titleInput by remember { mutableStateOf("") }
     var selectedTemplate by remember { mutableStateOf(MeetingTemplate.fromId(store.defaultMeetingTemplate)) }
     var searchQuery by remember { mutableStateOf("") }
+    var speakerCountHint by remember { mutableIntStateOf(-1) }
+    var languageHint by remember { mutableStateOf(store.languageHint) }
 
-    val modelReady = remember { ModelManager(context.applicationContext).isDownloaded() }
+    val modelReady = remember { ModelManager.getInstance(context.applicationContext).isDownloaded() }
 
     LaunchedEffect(Unit) {
         store.getRecordingSessionsFlow().collect { meetings = it.filter { s -> s.kind == "meeting" } }
@@ -87,13 +89,20 @@ fun MeetingsTab(
         val title = titleInput.ifBlank {
             "Meeting ${SimpleDateFormat("MMM dd, HH:mm", Locale.getDefault()).format(Date())}"
         }
-        MeetingRecordingController.start(context, UUID.randomUUID().toString(), title, selectedTemplate.id)
+        store.languageHint = languageHint
+        // 1:1 template implies 2 speakers unless the user chose a hint explicitly.
+        val effectiveCount = when {
+            speakerCountHint > 0 -> speakerCountHint
+            selectedTemplate == MeetingTemplate.ONE_ON_ONE -> 2
+            else -> -1
+        }
+        MeetingRecordingController.start(context, UUID.randomUUID().toString(), title, selectedTemplate.id, effectiveCount)
         titleInput = ""
     }
 
     val selectedMeeting = selectedMeetingId?.let { id -> meetings.firstOrNull { it.id == id } }
     if (selectedMeeting != null) {
-        MeetingDetailView(
+        MeetingDetailScreen(
             store = store,
             meeting = selectedMeeting,
             onBack = { selectedMeetingId = null },
@@ -178,6 +187,36 @@ fun MeetingsTab(
                             selected = selectedTemplate,
                             onSelected = { selectedTemplate = it }
                         )
+
+                        // v2: speaker count hint + language chips (Auto / EN / TH / ZH / YUE)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Speakers:", color = colors.textSecondary, fontSize = 12.sp)
+                            listOf(-1 to "Auto", 2 to "2", 3 to "3", 4 to "4", 5 to "5+").forEach { (count, label) ->
+                                FilterChip(
+                                    selected = speakerCountHint == count,
+                                    onClick = { speakerCountHint = count },
+                                    label = { Text(label, fontSize = 11.sp) }
+                                )
+                            }
+                        }
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Language:", color = colors.textSecondary, fontSize = 12.sp)
+                            listOf("auto", "en", "th", "zh", "yue").forEach { lang ->
+                                FilterChip(
+                                    selected = languageHint == lang,
+                                    onClick = { languageHint = lang },
+                                    label = { Text(lang.uppercase(), fontSize = 11.sp) }
+                                )
+                            }
+                        }
 
                         if (!modelReady) {
                             Text(
@@ -391,11 +430,25 @@ private fun ActiveMeetingCard(
                         .height(48.dp)
                 )
                 Spacer(modifier = Modifier.height(MuesliSpacing.s8))
-                Text(
-                    text = if (MeetingRecordingController.isFinalizing) "Transcribing remaining audio" else "Listening",
-                    color = colors.textSecondary,
-                    fontSize = 12.sp
-                )
+                val progress = MeetingRecordingController.diarizationProgress
+                if (MeetingRecordingController.isFinalizing && progress > 0f) {
+                    Text(
+                        text = "Identifying speakers (CAM++) · ${(progress * 100).toInt()}%",
+                        color = colors.textSecondary,
+                        fontSize = 12.sp
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    LinearProgressIndicator(
+                        progress = { progress.coerceIn(0f, 1f) },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                } else {
+                    Text(
+                        text = if (MeetingRecordingController.isFinalizing) "Transcribing remaining audio" else "Listening",
+                        color = colors.textSecondary,
+                        fontSize = 12.sp
+                    )
+                }
             }
 
             // Stop + Discard
