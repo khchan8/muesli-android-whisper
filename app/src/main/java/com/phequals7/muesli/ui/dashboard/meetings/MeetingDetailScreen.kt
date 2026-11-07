@@ -152,7 +152,7 @@ fun MeetingDetailScreen(
         scope.launch {
             if (notes != meeting.manualNotes) {
                 store.updateMeetingNotes(meeting.id, notes)
-                MeetingStorageManager.syncRecordingArtifacts(context.applicationContext, store, meeting.id)
+                MeetingStorageManager.exportSrtArtifactOnly(context.applicationContext, store, meeting.id)
             }
             onBack()
         }
@@ -162,7 +162,9 @@ fun MeetingDetailScreen(
         if (notes == meeting.manualNotes) return@LaunchedEffect
         delay(600)
         if (store.updateMeetingNotes(meeting.id, notes) > 0) {
-            MeetingStorageManager.syncRecordingArtifacts(context.applicationContext, store, meeting.id)
+            // Notes live in the SRT footer: subtitle-only export never
+            // touches the committed audio.
+            MeetingStorageManager.exportSrtArtifactOnly(context.applicationContext, store, meeting.id)
         }
     }
 
@@ -183,9 +185,19 @@ fun MeetingDetailScreen(
         }
     }
 
+    // Completed-session subtitle refresh keyed to persisted segment entities
+    // and summary text too (speaker labels / AI summary live in the SRT), not
+    // just note edits. Stage 2 never touches the committed audio.
+    LaunchedEffect(meeting.id, meeting.phase, meeting.summaryText, segmentEntities) {
+        if (meeting.phase != "completed") return@LaunchedEffect
+        launch(Dispatchers.IO) {
+            runCatching { MeetingStorageManager.exportSrtArtifactOnly(context.applicationContext, store, meeting.id) }
+        }
+    }
+
     // v2 recordings store an absolute /sdcard path; v0.3.x rows store a file name.
     val audioFilePath = remember(meeting.audioFileName) {
-        MeetingStorageManager.resolveRecordingWav(context.filesDir, meeting.audioFileName)?.absolutePath
+        MeetingStorageManager.resolveRecordingAudio(context.filesDir, meeting.audioFileName)?.absolutePath
     }
 
     val dateLine = remember(meeting.id) {
@@ -224,7 +236,7 @@ fun MeetingDetailScreen(
             scope.launch {
                 if (notes != meeting.manualNotes) {
                     store.updateMeetingNotes(meeting.id, notes)
-                    MeetingStorageManager.syncRecordingArtifacts(context.applicationContext, store, meeting.id)
+                    MeetingStorageManager.exportSrtArtifactOnly(context.applicationContext, store, meeting.id)
                 }
                 com.phequals7.muesli.meetings.MeetingSummaryService.generate(context, meeting.id)
             }
@@ -319,15 +331,15 @@ private fun MeetingDetailContent(
     // Same normalization as the on-disk SRT: on-screen cues and sidecars cannot diverge.
     val cues = remember(segments) { MeetingTranscriptSrt.normalizedSegments(segments) }
 
-    val wavFile = remember(audioFilePath) {
-        audioFilePath?.let { File(it) }?.takeIf { it.exists() && it.length() > 44L }
+    val audioFile = remember(audioFilePath) {
+        audioFilePath?.let { File(it) }?.takeIf { MeetingStorageManager.isUsableAudioFile(it) }
     }
 
-    val mediaPlayer = remember(wavFile?.absolutePath) {
-        if (wavFile != null) {
+    val mediaPlayer = remember(audioFile?.absolutePath) {
+        if (audioFile != null) {
             try {
                 MediaPlayer().apply {
-                    setDataSource(wavFile.absolutePath)
+                    setDataSource(audioFile.absolutePath)
                     prepare()
                     setOnCompletionListener {
                         isPlaying = false
@@ -421,7 +433,7 @@ private fun MeetingDetailContent(
                             overflow = TextOverflow.Ellipsis
                         )
                         Text(
-                            text = subtitleLine + (wavFile?.let {
+                            text = subtitleLine + (audioFile?.let {
                                 " · ${it.absolutePath.replace("/storage/emulated/0/", "/sdcard/")}"
                             } ?: ""),
                             style = MaterialTheme.typography.labelSmall,
@@ -458,7 +470,7 @@ private fun MeetingDetailContent(
             )
         },
         bottomBar = {
-            if (mediaPlayer != null && wavFile != null) {
+            if (mediaPlayer != null && audioFile != null) {
                 CompactPlayerBar(
                     isPlaying = isPlaying,
                     currentPositionMs = if (isUserDraggingSeekSlider) sliderPreviewMs.toLong() else currentPositionMs,

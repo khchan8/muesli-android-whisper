@@ -1,5 +1,6 @@
 package com.phequals7.muesli.data.entity
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 import java.util.UUID
@@ -27,9 +28,12 @@ data class RecordingSession(
     val summaryText: String = "",
     /** "notStarted", "generating", "completed", "failed", "unavailable". */
     val summaryState: String = "notStarted",
-    /** SAF document URI of the exported WAV in the user-chosen recordings folder (Room v6). */
-    val exportedWavUri: String? = null,
-    /** SAF document URI of the exported SRT beside the WAV (Room v6). */
+    /** SAF document URI of the exported audio (legacy WAV or new M4A) in the
+     *  user-chosen recordings folder (Room v6; physical column keeps its
+     *  historical `exportedWavUri` name). */
+    @ColumnInfo(name = "exportedWavUri")
+    val exportedAudioUri: String? = null,
+    /** SAF document URI of the exported SRT beside the audio (Room v6). */
     val exportedSrtUri: String? = null,
     /** Original title before the first AI-generated title, if one was added. */
     val originalTitle: String? = null

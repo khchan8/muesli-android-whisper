@@ -30,6 +30,7 @@ import com.phequals7.muesli.model.SpeechModels
 import com.phequals7.muesli.data.AppDatabase
 import com.phequals7.muesli.data.entity.MeetingTranscriptSegmentEntity
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -50,12 +51,18 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Foreground service that records a meeting and transcribes it on-device.
  *
  * Pipeline (Android counterpart of the iOS StreamingMeetingRecorder):
- *   AudioRecord 16 kHz float → WAV retention (16-bit PCM) → Silero VAD
+ *   AudioRecord 32 kHz PCM16 → M4A retention (AAC-LC 64 kbps via
+ *   [M4aAudioEncoder]) + pairwise 2:1 downsample to 16 kHz → Silero VAD
  *   speech segmentation (bundled model, iOS 3–60 s FluidAudio-VAD parity)
  *   → sequential Parakeet decode per segment → merged live transcript in
- *   [MeetingRecordingController] → Transcript row on stop. When speaker
- *   labels are enabled, the finished WAV is diarized (bundled pyannote +
- *   TitaNet models) and chunks are prefixed with "Speaker N · m:ss".
+ *   [MeetingRecordingController]. The 16 kHz stream also lands in a private
+ *   staging WAV that feeds speaker diarization (bundled pyannote + TitaNet
+ *   models) and is deleted after it; chunks are prefixed with
+ *   "Speaker N · m:ss".
+ *
+ * On stop the finalized M4A is published to the recordings folder
+ * immediately (Stage 1) while final ASR + diarization run; the SRT follows
+ * once the final transcript is persisted (Stage 2).
  *
  * If the VAD cannot be created, chunking falls back to fixed 30 s rotation.
  */
@@ -71,7 +78,9 @@ class MeetingRecorderService : Service() {
         const val EXTRA_TEMPLATE_ID = "template_id"
         const val EXTRA_EXPECTED_SPEAKERS = "expected_speakers"
 
-        private const val SAMPLE_RATE = 16000
+        private const val CAPTURE_SAMPLE_RATE = 32000
+        private const val MODEL_SAMPLE_RATE = 16000
+        private const val CAPTURE_JOIN_TIMEOUT_MS = 5_000L
         private const val CHUNK_SECONDS = 30 // fallback when VAD is unavailable
         private const val PARTIAL_INTERVAL_MS = 5_000L
         private const val CHANNEL_ID = "meeting_recording"
@@ -91,13 +100,31 @@ class MeetingRecorderService : Service() {
     private var sessionId: String? = null
     private var sessionTitle: String = ""
     private var startedAtMs: Long = 0
+    private var retainAudioAtStart = true
+    private var sessionInsert = CompletableDeferred<Unit>()
 
     private var audioRecord: AudioRecord? = null
     private var activeMicPref = AudioInputRouteManager.MicPreference.AUTO
     private var captureThread: Thread? = null
-    private var wavFile: File? = null
-    private var wavBytesWritten = 0L
+
+    /** Retained M4A + encoder: written by the capture thread, finalized by
+     *  the finalizer only after that thread has exited. */
+    private var audioFile: File? = null
+    private var encoder: M4aAudioEncoder? = null
+
+    /** Private 16 kHz staging WAV fed to diarization; never exported. */
+    private var stagingDir: File? = null
+    private var stagingWavFile: File? = null
+    private var stagingWriter: RandomAccessFile? = null
+    private var stagingBytesWritten = 0L
+    private val stagingByteBuffer = ByteArray((CAPTURE_SAMPLE_RATE / 10 / 2 + 1) * Short.SIZE_BYTES)
+
+    /** Permanent capture/codec error recorded by the capture loop. */
+    @Volatile
+    private var captureError: String? = null
+
     private var expectedSpeakers = -1
+    private var sessionTemplateId: String = "general"
 
     private val lock = Object()
     // Fixed-chunk fallback accumulation as append-only parts (concatenated
@@ -151,6 +178,12 @@ class MeetingRecorderService : Service() {
         sessionId = id
         sessionTitle = title
         startedAtMs = System.currentTimeMillis()
+        sessionTemplateId = templateId
+        // Snapshot retention at start: toggling the setting mid-recording
+        // applies to the next meeting, never to mismatched in-flight output.
+        retainAudioAtStart = store.retainMeetingAudio
+        captureError = null
+        sessionInsert = CompletableDeferred()
         transcriptParts.clear()
         synchronized(lock) {
             currentChunkParts.clear()
@@ -172,7 +205,7 @@ class MeetingRecorderService : Service() {
                         // iOS rotates VAD chunks at 3–60 s; 30 s caps decode latency per chunk.
                         maxSpeechDuration = 30f,
                     ),
-                    sampleRate = SAMPLE_RATE,
+                    sampleRate = MODEL_SAMPLE_RATE,
                     numThreads = 1,
                     provider = "cpu",
                 ),
@@ -182,18 +215,24 @@ class MeetingRecorderService : Service() {
             null
         }
 
+        val insert = sessionInsert
         serviceScope.launch {
-            store.insertRecordingSession(
-                RecordingSession(
-                    id = id,
-                    kind = "meeting",
-                    title = title,
-                    startedAt = startedAtMs,
-                    phase = "recording",
-                    engineIdentifier = selectedModel.id,
-                    templateId = templateId,
+            try {
+                store.insertRecordingSession(
+                    RecordingSession(
+                        id = id,
+                        kind = "meeting",
+                        title = title,
+                        startedAt = startedAtMs,
+                        phase = "recording",
+                        engineIdentifier = selectedModel.id,
+                        templateId = templateId,
+                    )
                 )
-            )
+                insert.complete(Unit)
+            } catch (t: Throwable) {
+                insert.completeExceptionally(t)
+            }
         }
 
         startForegroundWithNotification(title)
@@ -221,162 +260,289 @@ class MeetingRecorderService : Service() {
     private fun stopRecording(discard: Boolean) {
         if (!capturing.compareAndSet(true, false)) return
         finalizing.set(true)
+        val endedAt = System.currentTimeMillis()
         MeetingRecordingController.onFinalizing()
 
-        decodeExecutor.execute {
-            val id = sessionId
-            var retainAudio = store.retainMeetingAudio
-            var finalText = synchronized(transcriptParts) {
-                transcriptParts.joinToString("\n\n") { it.text }.trim()
-            }
-            val endedAt = System.currentTimeMillis()
-
-            var diarizationResult: SpeakerDiarizer.DiarizationResult? = null
-            // Whole-path guard: even when a pre-persist step throws, the
-            // finalization coroutine below still runs and always clears the
-            // controller + foreground state — Finishing can never wedge.
+        // Assigned immediately (main) so onTimeout/onDestroy can cancel the
+        // whole finalization, not just the tail after diarization.
+        finalizationJob = serviceScope.launch {
             try {
-                try {
-                    captureThread?.join(2_000)
-                } catch (_: InterruptedException) {
+                var failure: String? = null
+                var discardOutputs = discard
+                var finalText = synchronized(transcriptParts) {
+                    transcriptParts.joinToString("\n\n") { it.text }.trim()
                 }
-                releaseAudioRecord()
-                AudioInputRouteManager(applicationContext).stopBluetoothSco(activeMicPref)
-                startFinalizingForegroundNotification(sessionTitle)
+                var diarizationResult: SpeakerDiarizer.DiarizationResult? = null
+                val id = sessionId
 
-                if (!discard) {
-                    // Flush trailing speech out of the VAD, then rotate any
-                    // remaining fixed-fallback chunk.
-                    vad?.let { v ->
+                try {
+                    // 1. Stop the mic to unblock READ_BLOCKING, then wait
+                    //    (bounded) on IO for the capture thread before touching
+                    //    its encoder/writer. Codec/encoder calls carry their
+                    //    own 10 s no-progress bound.
+                    val joined = withContext(Dispatchers.IO) {
                         try {
+                            audioRecord?.stop()
+                        } catch (_: Throwable) {
+                        }
+                        val thread = captureThread
+                        if (thread != null) {
+                            try {
+                                thread.join(CAPTURE_JOIN_TIMEOUT_MS)
+                                !thread.isAlive
+                            } catch (_: InterruptedException) {
+                                false
+                            }
+                        } else {
+                            true
+                        }
+                    }
+                    releaseAudioRecord()
+                    AudioInputRouteManager(applicationContext).stopBluetoothSco(activeMicPref)
+                    startFinalizingForegroundNotification(sessionTitle)
+
+                    if (!joined) {
+                        // The capture thread is stuck; do not close objects it
+                        // may still be using. Its own finally path releases them.
+                        failure = "Recording capture did not shut down within " +
+                            "${CAPTURE_JOIN_TIMEOUT_MS / 1000}s; audio was not finalized."
+                    } else if (captureError != null) {
+                        failure = captureError
+                        // The capture thread has exited; release its codec
+                        // quietly so a vendor encoder cannot leak.
+                        runCatching { encoder?.stopAndRelease() }
+                        encoder = null
+                    } else if (discardOutputs) {
+                        discardPrivateOutputs()
+                    } else {
+                        // 2. Finalize encoder EOS/muxer and the staging header
+                        //    on IO, then publish the audio before any final ASR
+                        //    or diarization work — a slow ASR tail must not hold
+                        //    the finalized M4A behind the decode backlog.
+                        val m4aName = withContext(Dispatchers.IO) {
+                            encoder?.let { it.stopAndRelease() }
+                            encoder = null
+                            finalizeStaging()
+                            audioFile?.name
+                        }
+                        MeetingRecordingController.onFinalizationStatus("Saving audio")
+
+                        sessionInsert.await()
+                        if (id != null) {
+                            val marked = store.markRecordingStopped(id, endedAt, m4aName)
+                            if (marked == 1) {
+                                // Public export errors are saved on the row but
+                                // do not stop transcription/diarization and never
+                                // delete the private M4A.
+                                MeetingStorageManager.exportAudioArtifactImmediately(applicationContext, store, id)
+                            }
+                            // marked == 0: the row vanished or changed; never
+                            // recreate it or export on its behalf.
+                        }
+
+                        // 3. Final VAD/fallback flush + chunk decode on the
+                        //    single decodeExecutor, behind any in-flight
+                        //    decodes; bridge the one result back and await it.
+                        finalText = drainFinalSpeech(finalText)
+
+                        // 4. Free the ASR weights before pyannote + CAM++ load
+                        //    (v2.1 Root Cause B: three models exhaust the native
+                        //    heap), then diarize against the staging WAV.
+                        val staging = stagingWavFile
+                        if (store.speakerLabelsEnabled && staging != null && finalText.isNotBlank()) {
+                            SherpaRecognizerHolder.release()
+                            try {
+                                MeetingRecordingController.onFinalizationStatus("Identifying speakers")
+                                MeetingRecordingController.onDiarizationProgress(0.02f)
+                                diarizationResult = SpeakerDiarizer(
+                                    applicationContext,
+                                    AppDatabase.getSpeakerProfileStore(applicationContext)
+                                ).diarizeWavAndAlign(
+                                    sessionId = id ?: "",
+                                    wavFile = staging,
+                                    rawChunks = synchronized(transcriptParts) { transcriptParts.toList() },
+                                    expectedSpeakerCount = expectedSpeakers
+                                ) { progress ->
+                                    MeetingRecordingController.onDiarizationProgress(progress)
+                                }
+                                diarizationResult?.let { finalText = it.formattedInlineTranscript }
+                            } catch (t: Throwable) {
+                                Log.w(TAG, "Diarization failed, keeping unlabeled transcript: ${t.message}")
+                            }
+                        }
+                    }
+                } catch (e: CancellationException) {
+                    failure = failure ?: "Recording finalization was cancelled."
+                    discardOutputs = true // cancelled finalization publishes nothing
+                    throw e
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Recording finalization failed before persist", t)
+                    failure = failure ?: (t.message ?: t.javaClass.simpleName)
+                } finally {
+                    try {
+                        // The staging WAV is obsolete the moment its consumer
+                        // returns (or immediately when diarization never ran),
+                        // including failures, cancellation and discard.
+                        withContext(NonCancellable) { deleteStaging() }
+                    } catch (_: Throwable) {
+                    }
+                    releaseVad()
+                }
+
+                // Persist phase — always runs unless cancelled, so the
+                // controller + foreground state can never wedge (the old
+                // whole-path guard).
+                runCatching { sessionInsert.await() }
+                try {
+                    val existing = id?.let { store.getRecordingSessionById(it) }
+                    if (failure != null) {
+                        if (existing != null) {
+                            persistRecordingFailure(id!!, endedAt, failure, finalText, existing.engineIdentifier)
+                        } else {
+                            failSession(id ?: "", sessionTitle, sessionTemplateId, failure)
+                        }
+                    } else if (discardOutputs) {
+                        if (existing != null) {
+                            store.updateRecordingSession(
+                                existing.copy(phase = "cancelled", endedAt = endedAt)
+                            )
+                        }
+                    } else if (id != null && existing != null) {
+                        MeetingRecordingController.onFinalizationStatus("Saving recording")
+                        val transcript = Transcript(
+                            sessionID = id,
+                            text = finalText,
+                            engineIdentifier = existing.engineIdentifier
+                                ?: SpeechModels.selected(applicationContext).id
+                        )
+                        store.insertTranscript(transcript)
+
+                        // Structured segments: diarized speaker blocks when
+                        // diarization ran; otherwise one block per decoded chunk
+                        // (single speaker) so synchronized playback still works.
+                        val rawChunks = synchronized(transcriptParts) { transcriptParts.toList() }
+                        val segments = diarizationResult?.segments
+                            ?: SpeakerDiarizer(applicationContext)
+                                .alignTurnsWithTranscriptChunks(id, emptyList(), rawChunks)
+                        store.replaceTranscriptSegments(
+                            id,
+                            segments.map { MeetingTranscriptSegmentEntity.fromDomainModel(it) },
+                            finalText
+                        )
+
+                        // Field-scoped completion keeps the already-committed
+                        // audio path/URI and any export error; only then does
+                        // Stage 2 run.
+                        if (store.completeRecording(id, transcript.id) == 1) {
+                            MeetingStorageManager.exportSrtArtifactOnly(applicationContext, store, id)
+                        }
+
+                        // Hand the automatic summary off while still foreground;
+                        // ownership registers synchronously so a second recording
+                        // cannot race in before teardown.
+                        if (store.summariesEnabled) {
+                            MeetingSummaryService.generate(applicationContext, id, fromRecorderHandoff = true)
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Recording persist failed", t)
+                    val failedId = id
+                    if (failedId != null && failure == null) {
+                        // Never flip an already-completed session to failed
+                        // because a post-completion step (e.g. summary handoff)
+                        // threw.
+                        val phase = runCatching {
+                            store.getRecordingSessionById(failedId)?.phase
+                        }.getOrNull()
+                        if (phase != "completed") {
+                            runCatching {
+                                persistRecordingFailure(
+                                    failedId, endedAt,
+                                    t.message ?: t.javaClass.simpleName, finalText, null
+                                )
+                            }
+                        }
+                    }
+                }
+            } finally {
+                withContext(NonCancellable) {
+                    finalizationJob = null
+                    finalizing.set(false)
+                    MeetingRecordingController.onFinished()
+                    teardown()
+                }
+            }
+        }
+    }
+
+    /** Failure persistence: visible `failed` phase, saved transcript when one
+     *  was decoded, preserved private files, no public artifacts claimed. */
+    private suspend fun persistRecordingFailure(
+        id: String,
+        endedAt: Long,
+        message: String,
+        finalText: String,
+        engineIdentifier: String?
+    ) {
+        val transcriptId: String? = if (finalText.isNotBlank()) {
+            val transcript = Transcript(
+                sessionID = id,
+                text = finalText,
+                engineIdentifier = engineIdentifier ?: SpeechModels.selected(applicationContext).id
+            )
+            store.insertTranscript(transcript)
+            transcript.id
+        } else {
+            null
+        }
+        store.failRecording(id, endedAt, message, transcriptId)
+    }
+
+    /**
+     * Enqueues the final VAD flush + fallback rotation + chunk decode on the
+     * single decodeExecutor (behind in-flight decodes) and awaits the result.
+     * Cancellation still waits for the running executor task to finish before
+     * unwinding, so the recognizer is never released underneath native code.
+     */
+    private suspend fun drainFinalSpeech(currentText: String): String {
+        val drained = CompletableDeferred<Unit>()
+        val submitted = runCatching {
+            decodeExecutor.execute {
+                try {
+                    try {
+                        vad?.let { v ->
                             v.flush()
                             drainVadSegments(v)
-                        } catch (t: Throwable) {
-                            Log.w(TAG, "VAD flush failed: ${t.message}")
                         }
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "VAD flush failed: ${t.message}")
                     }
                     synchronized(lock) {
                         if (currentChunkSize > 0) {
-                            val endSec = samplesCaptured.toFloat() / SAMPLE_RATE
+                            val endSec = samplesCaptured.toFloat() / MODEL_SAMPLE_RATE
                             finishedChunks.offer(TimedChunk(concatParts(), currentChunkStartSec, endSec))
                             currentChunkParts.clear()
                             currentChunkSize = 0
                         }
                     }
                     drainChunkQueue()
-                    finalText = synchronized(transcriptParts) {
-                        transcriptParts.joinToString("\n\n") { it.text }.trim()
-                    }
-                }
-
-                closeWav()
-
-                val wav = wavFile
-                if (!discard && store.speakerLabelsEnabled && wav != null && finalText.isNotBlank()) {
-                    // v2.1 Root Cause B: all decode work is finished — free the ASR
-                    // weights (under the holder's mutex) before pyannote + CAM++
-                    // load, or the three models together exhaust the native heap.
-                    runBlocking { SherpaRecognizerHolder.release() }
-                    try {
-                        MeetingRecordingController.onFinalizationStatus("Identifying speakers")
-                        MeetingRecordingController.onDiarizationProgress(0.02f)
-                        diarizationResult = runBlocking {
-                            SpeakerDiarizer(
-                                applicationContext,
-                                AppDatabase.getSpeakerProfileStore(applicationContext)
-                            ).diarizeWavAndAlign(
-                                sessionId = id ?: "",
-                                wavFile = wav,
-                                rawChunks = synchronized(transcriptParts) { transcriptParts.toList() },
-                                expectedSpeakerCount = expectedSpeakers
-                            ) { progress ->
-                                MeetingRecordingController.onDiarizationProgress(progress)
-                            }
-                        }
-                        diarizationResult?.let { finalText = it.formattedInlineTranscript }
-                    } catch (t: Throwable) {
-                        Log.w(TAG, "Diarization failed, keeping unlabeled transcript: ${t.message}")
-                    }
-                }
-
-                // Audio retention is user-controlled; the temp WAV written for
-                // diarization is removed when retention is off.
-                if (!retainAudio) {
-                    wavFile?.delete()
-                }
-            } catch (t: Throwable) {
-                Log.e(TAG, "Recording finalization failed before persist", t)
-            } finally {
-                releaseVad()
-            }
-
-            finalizationJob = serviceScope.launch {
-                try {
-                    if (id != null) {
-                        val existing = store.getRecordingSessionById(id)
-                        if (existing != null) {
-                            if (discard) {
-                                store.updateRecordingSession(
-                                    existing.copy(phase = "cancelled", endedAt = endedAt)
-                                )
-                                wavFile?.delete()
-                            } else {
-                                MeetingRecordingController.onFinalizationStatus("Saving recording")
-                                val transcript = Transcript(
-                                    sessionID = id,
-                                    text = finalText,
-                                    engineIdentifier = existing.engineIdentifier
-                                        ?: SpeechModels.selected(applicationContext).id
-                                )
-                                store.insertTranscript(transcript)
-
-                                // Structured segments: diarized speaker blocks when
-                                // diarization ran; otherwise one block per decoded chunk
-                                // (single speaker) so synchronized playback still works.
-                                val rawChunks = synchronized(transcriptParts) { transcriptParts.toList() }
-                                val segments = diarizationResult?.segments
-                                    ?: SpeakerDiarizer(applicationContext)
-                                        .alignTurnsWithTranscriptChunks(id, emptyList(), rawChunks)
-                                store.replaceTranscriptSegments(
-                                    id,
-                                    segments.map { MeetingTranscriptSegmentEntity.fromDomainModel(it) },
-                                    finalText
-                                )
-
-                                // Retained recordings always live in the private
-                                // meetings dir; the stored value is the bare filename.
-                                val storedAudioPath = wavFile?.takeIf { retainAudio }?.name
-                                store.updateRecordingSession(
-                                    existing.copy(
-                                        phase = "completed",
-                                        endedAt = endedAt,
-                                        audioFileName = storedAudioPath,
-                                        transcriptID = transcript.id,
-                                    )
-                                )
-
-                                // Save the private SRT sidecar and attempt the public
-                                // export before the summary starts.
-                                MeetingStorageManager.syncRecordingArtifacts(applicationContext, store, id)
-
-                                // Hand the automatic summary off while still foreground;
-                                // ownership registers synchronously so a second
-                                // recording cannot race in before teardown.
-                                if (store.summariesEnabled) {
-                                    MeetingSummaryService.generate(applicationContext, id, fromRecorderHandoff = true)
-                                }
-                            }
-                        }
-                    }
-                } finally {
-                    withContext(NonCancellable) {
-                        finalizationJob = null
-                        finalizing.set(false)
-                        MeetingRecordingController.onFinished()
-                        teardown()
-                    }
+                    drained.complete(Unit)
+                } catch (t: Throwable) {
+                    drained.completeExceptionally(t)
                 }
             }
+        }
+        if (submitted.isFailure) return currentText // executor already gone
+        try {
+            drained.await()
+        } catch (e: CancellationException) {
+            withContext(NonCancellable) { runCatching { drained.await() } }
+            throw e
+        } catch (t: Throwable) {
+            Log.e(TAG, "Final decode failed", t)
+        }
+        return synchronized(transcriptParts) {
+            transcriptParts.joinToString("\n\n") { it.text }.trim()
         }
     }
 
@@ -440,13 +606,19 @@ class MeetingRecorderService : Service() {
 
     override fun onDestroy() {
         capturing.set(false)
-        finalizing.set(false)
-        releaseAudioRecord()
-        AudioInputRouteManager(applicationContext).stopBluetoothSco(activeMicPref)
-        closeWav()
-        releaseVad()
+        finalizationJob?.cancel()
         decodeExecutor.shutdown()
         serviceScope.cancel()
+        // The finalizer owns encoder/writer/VAD while active; only clean them
+        // up here when no finalization ever ran (crash/startup-failure path).
+        if (finalizing.compareAndSet(true, false)) {
+            releaseAudioRecord()
+            AudioInputRouteManager(applicationContext).stopBluetoothSco(activeMicPref)
+            runCatching { encoder?.stopAndRelease() }
+            encoder = null
+            closeStagingQuietly()
+            releaseVad()
+        }
         super.onDestroy()
     }
 
@@ -454,9 +626,11 @@ class MeetingRecorderService : Service() {
 
     @SuppressLint("MissingPermission") // RECORD_AUDIO granted before reaching here
     private fun startCaptureThread() {
-        val minBuffer = AudioRecord.getMinBufferSize(
-            SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_FLOAT
+        val minBufferBytes = AudioRecord.getMinBufferSize(
+            CAPTURE_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
+        check(minBufferBytes > 0) { "32 kHz mono microphone input is unavailable on this device" }
+
         val pref = AudioInputRouteManager.MicPreference.fromId(store.micPreference)
         activeMicPref = pref
         val routeManager = AudioInputRouteManager(applicationContext)
@@ -467,99 +641,165 @@ class MeetingRecorderService : Service() {
             .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
             .setAudioFormat(
                 AudioFormat.Builder()
-                    .setSampleRate(SAMPLE_RATE)
+                    .setSampleRate(CAPTURE_SAMPLE_RATE)
                     .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
-                    .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                     .build()
             )
-            .setBufferSizeInBytes(maxOf(minBuffer, SAMPLE_RATE))
+            .setBufferSizeInBytes(maxOf(minBufferBytes, CAPTURE_SAMPLE_RATE * Short.SIZE_BYTES / 10))
             .build()
-        check(record.state == AudioRecord.STATE_INITIALIZED) { "AudioRecord failed to initialize" }
-        routeManager.resolveDevice(pref)?.let { record.setPreferredDevice(it) }
-        audioRecord = record
+        try {
+            check(record.state == AudioRecord.STATE_INITIALIZED) { "AudioRecord failed to initialize" }
+            check(record.sampleRate == CAPTURE_SAMPLE_RATE) {
+                "Microphone does not support 32 kHz capture (reported ${record.sampleRate} Hz)"
+            }
+            routeManager.resolveDevice(pref)?.let { record.setPreferredDevice(it) }
+            audioRecord = record
 
-        // The WAV is always written: it feeds diarization at stop. When the
-        // user disabled audio retention it is written under a temp name and
-        // deleted during finalizing. Retained recordings always capture to
-        // the private meetings dir; the public copy is exported through the
-        // granted recordings folder after the recording completes.
-        wavFile = if (store.retainMeetingAudio) {
-            MeetingStorageManager.createSessionWavFile(
-                MeetingStorageManager.internalRecordingsDirectory(filesDir),
-                sessionTitle,
-                startedAtMs
+            // The 16 kHz staging WAV always exists: it feeds diarization at
+            // stop and is deleted right after. It must never be exported or
+            // become the session's audioFileName.
+            val dir = File(cacheDir, "temp_meetings/$sessionId")
+            check(dir.mkdirs() || dir.isDirectory) { "Could not create the staging directory" }
+            val staging = File(dir, "staging_16k.wav")
+            val writer = RandomAccessFile(staging, "rw")
+            writer.setLength(0)
+            writer.write(wavHeaderBytes(0))
+            stagingDir = dir
+            stagingWavFile = staging
+            stagingWriter = writer
+            stagingBytesWritten = 0L
+
+            // Retained captures reserve an .m4a in the private meetings dir;
+            // the public copy is exported through the granted recordings
+            // folder as soon as capture stops. No encoder → no retained audio.
+            if (retainAudioAtStart) {
+                val target = MeetingStorageManager.createSessionAudioFile(
+                    MeetingStorageManager.internalRecordingsDirectory(filesDir),
+                    sessionTitle,
+                    startedAtMs
+                )
+                audioFile = target
+                encoder = M4aAudioEncoder(target)
+            } else {
+                audioFile = null
+                encoder = null
+            }
+
+            // Start the microphone only after the writer/encoder init succeeded.
+            record.startRecording()
+            captureThread = Thread { captureLoop(record) }.also { it.start() }
+        } catch (t: Throwable) {
+            releaseAudioRecord()
+            runCatching { encoder?.stopAndRelease() }
+            encoder = null
+            closeStagingQuietly()
+            // Remove only this attempt's empty/invalid files.
+            stagingWavFile?.delete()
+            stagingDir?.deleteRecursively()
+            audioFile?.delete()
+            audioFile = null
+            stagingDir = null
+            stagingWavFile = null
+            throw t
+        }
+    }
+
+    private fun captureLoop(record: AudioRecord) {
+        val captureBuf = ShortArray(CAPTURE_SAMPLE_RATE / 10) // 100 ms @ 32 kHz
+        val downBuf = ShortArray(captureBuf.size / 2 + 1) // 100 ms @ 16 kHz (+ carry)
+        val downsampler = Pcm32kTo16kDownsampler()
+        var lastPartialAt = System.currentTimeMillis()
+
+        while (capturing.get()) {
+            val read = try {
+                record.read(captureBuf, 0, captureBuf.size, AudioRecord.READ_BLOCKING)
+            } catch (t: Throwable) {
+                captureError = "Microphone read failed: ${t.message}"
+                break
+            }
+            if (read < 0) {
+                captureError = "Microphone read failed (error $read)"
+                break
+            }
+            if (read == 0) continue
+
+            val downCount = downsampler.process(captureBuf, read, downBuf)
+            try {
+                appendStagingPcm16(downBuf, downCount)
+            } catch (t: Throwable) {
+                captureError = "Staging audio write failed: ${t.message}"
+                break
+            }
+            try {
+                encoder?.encodePcmShorts(captureBuf, read)
+            } catch (t: Throwable) {
+                captureError = "M4A encoding failed: ${t.message}"
+                break
+            }
+
+            // An odd short read can leave zero downsampled samples (the odd
+            // one waits in the carry): staging/encoding consumed it, but the
+            // 16 kHz model frame is empty this round.
+            val frame = FloatArray(downCount) { downBuf[it] / 32768f }
+            if (downCount > 0) publishLevel(downBuf, downCount)
+
+            val frameStartSec: Float
+            synchronized(lock) {
+                frameStartSec = samplesCaptured.toFloat() / MODEL_SAMPLE_RATE
+                samplesCaptured += downCount
+            }
+
+            val v = vad
+            if (v != null) {
+                try {
+                    v.acceptWaveform(frame)
+                    drainVadSegments(v)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "VAD failed mid-capture, using fixed chunks: ${t.message}")
+                    try { v.release() } catch (_: Throwable) {}
+                    vad = null
+                }
+            } else {
+                synchronized(lock) {
+                    if (currentChunkSize == 0) currentChunkStartSec = frameStartSec
+                    currentChunkParts.add(frame)
+                    currentChunkSize += downCount
+                    if (currentChunkSize >= MODEL_SAMPLE_RATE * CHUNK_SECONDS) {
+                        finishedChunks.offer(
+                            TimedChunk(
+                                concatParts(),
+                                currentChunkStartSec,
+                                currentChunkStartSec + currentChunkSize.toFloat() / MODEL_SAMPLE_RATE
+                            )
+                        )
+                        currentChunkParts.clear()
+                        currentChunkSize = 0
+                    }
+                }
+            }
+            scheduleChunkDecode()
+
+            val elapsedSec = ((System.currentTimeMillis() - startedAtMs) / 1000L).toInt()
+            val now = System.currentTimeMillis()
+            if (now - lastPartialAt >= PARTIAL_INTERVAL_MS) {
+                lastPartialAt = now
+                schedulePartial()
+            }
+            MeetingRecordingController.onProgress(
+                elapsedSec,
+                lastLevel,
+                lastPartial,
+                synchronized(transcriptParts) { transcriptParts.joinToString("\n\n") { it.text } }
             )
-        } else {
-            File(cacheDir, "temp_meetings/.tmp-$sessionId.wav")
-        }.apply {
-            parentFile?.mkdirs()
-            writeWavHeader(this, 0)
         }
 
-        record.startRecording()
-
-        captureThread = Thread {
-            val chunk = FloatArray(SAMPLE_RATE / 10) // 100 ms
-            var lastPartialAt = System.currentTimeMillis()
-
-            while (capturing.get()) {
-                val read = record.read(chunk, 0, chunk.size, AudioRecord.READ_BLOCKING)
-                if (read <= 0) continue
-
-                appendToWav(chunk, read)
-                publishLevel(chunk, read)
-
-                val frame = chunk.copyOf(read)
-                val frameStartSec: Float
-                synchronized(lock) {
-                    frameStartSec = samplesCaptured.toFloat() / SAMPLE_RATE
-                    samplesCaptured += read
-                }
-
-                val v = vad
-                if (v != null) {
-                    try {
-                        v.acceptWaveform(frame)
-                        drainVadSegments(v)
-                    } catch (t: Throwable) {
-                        Log.w(TAG, "VAD failed mid-capture, using fixed chunks: ${t.message}")
-                        try { v.release() } catch (_: Throwable) {}
-                        vad = null
-                    }
-                } else {
-                    synchronized(lock) {
-                        if (currentChunkSize == 0) currentChunkStartSec = frameStartSec
-                        currentChunkParts.add(frame)
-                        currentChunkSize += read
-                        if (currentChunkSize >= SAMPLE_RATE * CHUNK_SECONDS) {
-                            finishedChunks.offer(
-                                TimedChunk(
-                                    concatParts(),
-                                    currentChunkStartSec,
-                                    currentChunkStartSec + currentChunkSize.toFloat() / SAMPLE_RATE
-                                )
-                            )
-                            currentChunkParts.clear()
-                            currentChunkSize = 0
-                        }
-                    }
-                }
-                scheduleChunkDecode()
-
-                val elapsedSec = ((System.currentTimeMillis() - startedAtMs) / 1000L).toInt()
-                val now = System.currentTimeMillis()
-                if (now - lastPartialAt >= PARTIAL_INTERVAL_MS) {
-                    lastPartialAt = now
-                    schedulePartial()
-                }
-                MeetingRecordingController.onProgress(
-                    elapsedSec,
-                    lastLevel,
-                    lastPartial,
-                    synchronized(transcriptParts) { transcriptParts.joinToString("\n\n") { it.text } }
-                )
-            }
-        }.also { it.start() }
+        if (captureError != null && capturing.get()) {
+            // Permanent capture failure: request the normal finalization path
+            // (which marks the session failed) instead of dropping audio
+            // silently.
+            stopRecording(discard = false)
+        }
     }
 
     /** Concatenates the fallback chunk parts once (call with [lock] held). */
@@ -579,9 +819,9 @@ class MeetingRecorderService : Service() {
         while (!v.empty()) {
             val segment = v.front()
             v.pop()
-            if (segment.samples.size < SAMPLE_RATE / 2) continue
-            val startSec = segment.start.toFloat() / SAMPLE_RATE
-            val endSec = startSec + segment.samples.size.toFloat() / SAMPLE_RATE
+            if (segment.samples.size < MODEL_SAMPLE_RATE / 2) continue
+            val startSec = segment.start.toFloat() / MODEL_SAMPLE_RATE
+            val endSec = startSec + segment.samples.size.toFloat() / MODEL_SAMPLE_RATE
             finishedChunks.offer(TimedChunk(segment.samples, startSec, endSec))
         }
         scheduleChunkDecode()
@@ -593,10 +833,13 @@ class MeetingRecorderService : Service() {
     @Volatile
     private var lastPartial = ""
 
-    private fun publishLevel(chunk: FloatArray, read: Int) {
+    private fun publishLevel(samples: ShortArray, count: Int) {
         var sum = 0.0
-        for (i in 0 until read) sum += chunk[i] * chunk[i]
-        val rms = kotlin.math.sqrt(sum / read).toFloat()
+        for (i in 0 until count) {
+            val s = samples[i] / 32768f
+            sum += (s * s).toDouble()
+        }
+        val rms = kotlin.math.sqrt(sum / count).toFloat()
         val db = 20f * kotlin.math.log10(rms + 1e-8f)
         lastLevel = ((db + 45f) / 35f).coerceIn(0f, 1f)
     }
@@ -618,7 +861,7 @@ class MeetingRecorderService : Service() {
     private fun drainChunkQueue() {
         while (true) {
             val chunk = finishedChunks.poll() ?: break
-            if (chunk.pcm.size < SAMPLE_RATE / 2) continue
+            if (chunk.pcm.size < MODEL_SAMPLE_RATE / 2) continue
             try {
                 val result = decode(chunk.pcm)
                 if (result.text.isNotBlank()) {
@@ -667,63 +910,85 @@ class MeetingRecorderService : Service() {
         return processed.trim()
     }
 
-    // ── WAV retention ────────────────────────────────────────────────────
+    // ── staging WAV + retained M4A ───────────────────────────────────────
 
-    private fun appendToWav(chunk: FloatArray, read: Int) {
-        val file = wavFile ?: return
+    /** Appends already-downsampled 16 kHz shorts to the open staging writer. */
+    private fun appendStagingPcm16(samples: ShortArray, count: Int) {
+        val writer = stagingWriter ?: return
+        for (i in 0 until count) {
+            val s = samples[i].toInt()
+            stagingByteBuffer[i * 2] = (s and 0xFF).toByte()
+            stagingByteBuffer[i * 2 + 1] = (s shr 8 and 0xFF).toByte()
+        }
+        writer.write(stagingByteBuffer, 0, count * Short.SIZE_BYTES)
+        stagingBytesWritten += count * Short.SIZE_BYTES.toLong()
+    }
+
+    /** Patches the final data length into the staging header and closes it. */
+    private fun finalizeStaging() {
+        val writer = stagingWriter ?: return
         try {
-            RandomAccessFile(file, "rw").use { raf ->
-                raf.seek(file.length())
-                val bytes = ByteArray(read * 2)
-                for (i in 0 until read) {
-                    val s = (chunk[i].coerceIn(-1f, 1f) * 32767f).toInt().toShort()
-                    bytes[i * 2] = (s.toInt() and 0xFF).toByte()
-                    bytes[i * 2 + 1] = (s.toInt() shr 8 and 0xFF).toByte()
-                }
-                raf.write(bytes)
-                wavBytesWritten += bytes.size
-            }
-        } catch (t: Throwable) {
-            Log.w(TAG, "WAV append failed: ${t.message}")
+            writer.seek(0)
+            writer.write(wavHeaderBytes(stagingBytesWritten))
+        } finally {
+            writer.close()
+            stagingWriter = null
         }
     }
 
-    private fun closeWav() {
-        val file = wavFile ?: return
+    private fun closeStagingQuietly() {
         try {
-            writeWavHeader(file, wavBytesWritten)
-        } catch (t: Throwable) {
-            Log.w(TAG, "WAV header patch failed: ${t.message}")
+            stagingWriter?.close()
+        } catch (_: Throwable) {
+        }
+        stagingWriter = null
+    }
+
+    /** Deletes the staging WAV and its session directory (NonCancellable). */
+    private suspend fun deleteStaging() {
+        withContext(NonCancellable) {
+            closeStagingQuietly()
+            stagingWavFile?.delete()
+            stagingDir?.deleteRecursively()
+            stagingWavFile = null
+            stagingDir = null
         }
     }
 
-    private fun writeWavHeader(file: File, dataBytes: Long) {
-        RandomAccessFile(file, "rw").use { raf ->
-            val byteRate = SAMPLE_RATE * 2
-            val header = ByteArray(44)
-            fun putStr(off: Int, s: String) {
-                for (i in s.indices) header[off + i] = s[i].code.toByte()
-            }
-            fun putInt(off: Int, v: Long) {
-                header[off] = (v and 0xFF).toByte()
-                header[off + 1] = (v shr 8 and 0xFF).toByte()
-                header[off + 2] = (v shr 16 and 0xFF).toByte()
-                header[off + 3] = (v shr 24 and 0xFF).toByte()
-            }
-            fun putShort(off: Int, v: Int) {
-                header[off] = (v and 0xFF).toByte()
-                header[off + 1] = (v shr 8 and 0xFF).toByte()
-            }
-            putStr(0, "RIFF"); putInt(4, 36 + dataBytes); putStr(8, "WAVE")
-            putStr(12, "fmt "); putInt(16, 16); putShort(20, 1); putShort(22, 1)
-            putInt(24, SAMPLE_RATE.toLong()); putInt(28, byteRate.toLong())
-            putShort(32, 2); putShort(34, 16)
-            putStr(36, "data"); putInt(40, dataBytes)
-            raf.seek(0)
-            raf.write(header)
-        }
+    /** Discard keeps nothing: release the encoder quietly and remove this
+     *  session's private outputs. */
+    private fun discardPrivateOutputs() {
+        runCatching { encoder?.stopAndRelease() }
+        encoder = null
+        audioFile?.delete()
+        audioFile = null
+        closeStagingQuietly()
     }
 
+    /** Minimal 44-byte mono 16-bit PCM WAV header at the model sample rate. */
+    private fun wavHeaderBytes(dataBytes: Long): ByteArray {
+        val byteRate = MODEL_SAMPLE_RATE * Short.SIZE_BYTES
+        val header = ByteArray(44)
+        fun putStr(off: Int, s: String) {
+            for (i in s.indices) header[off + i] = s[i].code.toByte()
+        }
+        fun putInt(off: Int, v: Long) {
+            header[off] = (v and 0xFF).toByte()
+            header[off + 1] = (v shr 8 and 0xFF).toByte()
+            header[off + 2] = (v shr 16 and 0xFF).toByte()
+            header[off + 3] = (v shr 24 and 0xFF).toByte()
+        }
+        fun putShort(off: Int, v: Int) {
+            header[off] = (v and 0xFF).toByte()
+            header[off + 1] = (v shr 8 and 0xFF).toByte()
+        }
+        putStr(0, "RIFF"); putInt(4, 36 + dataBytes); putStr(8, "WAVE")
+        putStr(12, "fmt "); putInt(16, 16); putShort(20, 1); putShort(22, 1)
+        putInt(24, MODEL_SAMPLE_RATE.toLong()); putInt(28, byteRate.toLong())
+        putShort(32, Short.SIZE_BYTES); putShort(34, 16)
+        putStr(36, "data"); putInt(40, dataBytes)
+        return header
+    }
 
     // ── notification ─────────────────────────────────────────────────────
 

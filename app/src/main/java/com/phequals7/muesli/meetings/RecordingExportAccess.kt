@@ -11,9 +11,9 @@ import androidx.compose.ui.platform.LocalContext
 import com.phequals7.muesli.data.SharedStore
 
 /**
- * One-time SAF folder grant for paired WAV/SRT exports. The user picks the
- * folder once (Recordings/Muesli suggested); the grant is persisted and every
- * later export writes directly there.
+ * One-time SAF folder grant for audio (M4A/legacy WAV) + SRT exports. The
+ * user picks the folder once (Recordings/Muesli suggested); the grant is
+ * persisted and every later export writes directly there.
  */
 object RecordingExportAccess {
 

@@ -112,7 +112,7 @@ class MigrationTest {
         assertEquals("general", session.templateId) // MIGRATION_2_3 default
         assertEquals("", session.summaryText)
         assertEquals("notStarted", session.summaryState)
-        assertNull("v6 export pointers default to null", session.exportedWavUri)
+        assertNull("v6 export pointers default to null", session.exportedAudioUri)
         assertNull(session.exportedSrtUri)
         assertNull(session.originalTitle)
         runBlocking {
@@ -264,7 +264,7 @@ class MigrationTest {
             assertEquals("old summary", session.summaryText)
             assertEquals("completed", session.summaryState)
             assertEquals("Meeting_2026.wav", session.audioFileName)
-            assertNull("MIGRATION_5_6 leaves existing rows' pointers null", session.exportedWavUri)
+            assertNull("MIGRATION_5_6 leaves existing rows' pointers null", session.exportedAudioUri)
             assertNull(session.exportedSrtUri)
             assertEquals("v5 transcript text", db.transcriptDao().getTranscriptForSession("v5s")?.text)
             assertEquals(1, db.transcriptSegmentDao().getSegmentsForSession("v5s").size)
@@ -274,7 +274,7 @@ class MigrationTest {
     }
 
     @Test
-    fun exportUrisCommitTogetherAndExportErrorPredicateProtectsUnrelatedFailures() {
+    fun twoStageExportPointersCommitIndependentlyAndErrorPredicateProtectsUnrelatedFailures() {
         createV5Database()
 
         val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
@@ -283,16 +283,23 @@ class MigrationTest {
 
         runBlocking {
             val dao = db.recordingSessionDao()
-            // Guarded commit: only while the row still holds the expected audio path.
-            assertEquals(
-                1,
-                dao.updateRecordingExportUris("v5s", "Meeting_2026.wav", "tree://wav", "tree://srt")
+
+            // Old physical exportedWavUri values load into the renamed
+            // property without a migration or version bump.
+            db.openHelper.writableDatabase.execSQL(
+                "UPDATE recording_sessions SET exportedWavUri = 'tree://legacy' WHERE id = 'v5s'"
             )
-            assertEquals(
-                0,
-                dao.updateRecordingExportUris("v5s", "stale.wav", "tree://w2", "tree://s2")
-            )
-            assertEquals("tree://wav", dao.getSessionById("v5s")?.exportedWavUri)
+            assertEquals("tree://legacy", dao.getSessionById("v5s")?.exportedAudioUri)
+
+            // Stage 1: guarded by the row still holding the expected audio path.
+            assertEquals(1, dao.updateExportedAudioUri("v5s", "Meeting_2026.wav", "tree://audio"))
+            assertEquals(0, dao.updateExportedAudioUri("v5s", "stale.wav", "tree://a2"))
+            assertEquals("tree://audio", dao.getSessionById("v5s")?.exportedAudioUri)
+
+            // Stage 2: additionally guarded by the committed audio URI.
+            assertEquals(1, dao.updateExportedSrtUri("v5s", "Meeting_2026.wav", "tree://audio", "tree://srt"))
+            assertEquals(0, dao.updateExportedSrtUri("v5s", "stale.wav", "tree://audio", "tree://s2"))
+            assertEquals(0, dao.updateExportedSrtUri("v5s", "Meeting_2026.wav", "tree://wrong", "tree://s3"))
             assertEquals("tree://srt", dao.getSessionById("v5s")?.exportedSrtUri)
 
             // An export error may be set (null current) and replaced (prefixed),
@@ -306,6 +313,48 @@ class MigrationTest {
             assertEquals(0, dao.updateExportError("v5s", "Recording export failed: x"))
             assertEquals(0, dao.updateExportError("v5s", null))
             assertEquals("Microphone failed", dao.getSessionById("v5s")?.errorMessage)
+
+            // An audio-stage success clears only its own failure, never a
+            // prior subtitle failure.
+            db.openHelper.writableDatabase.execSQL("UPDATE recording_sessions SET errorMessage = 'Recording export failed: SRT: boom' WHERE id = 'v5s'")
+            assertEquals(0, dao.clearAudioExportError("v5s"))
+            assertEquals("Recording export failed: SRT: boom", dao.getSessionById("v5s")?.errorMessage)
+            db.openHelper.writableDatabase.execSQL("UPDATE recording_sessions SET errorMessage = 'Recording export failed: Audio: boom' WHERE id = 'v5s'")
+            assertEquals(1, dao.clearAudioExportError("v5s"))
+            assertEquals(null, dao.getSessionById("v5s")?.errorMessage)
+
+            // Two-stage phase transitions: guarded, field-scoped, and
+            // preserving notes/title/summary plus committed pointers.
+            db.openHelper.writableDatabase.execSQL("UPDATE recording_sessions SET phase = 'recording' WHERE id = 'v5s'")
+            assertEquals(1, dao.markRecordingStopped("v5s", 1793975401000L, "Meeting_2026.wav"))
+            assertEquals(0, dao.markRecordingStopped("v5s", 1L, null)) // no longer recording
+            val transcribing = dao.getSessionById("v5s")!!
+            assertEquals("transcribing", transcribing.phase)
+            assertEquals(1793975401000L, transcribing.endedAt)
+            assertEquals("kept notes", transcribing.manualNotes)
+            assertEquals("v5 title", transcribing.title)
+            assertEquals("old summary", transcribing.summaryText)
+
+            assertEquals(1, dao.completeRecording("v5s", "t9"))
+            assertEquals(0, dao.completeRecording("v5s", "t10")) // no longer transcribing
+            val completed = dao.getSessionById("v5s")!!
+            assertEquals("completed", completed.phase)
+            assertEquals("t9", completed.transcriptID)
+            assertEquals("kept notes", completed.manualNotes)
+            assertEquals("v5 title", completed.title)
+            assertEquals("Meeting_2026.wav", completed.audioFileName)
+            assertEquals("tree://audio", completed.exportedAudioUri) // audio URI survives completion
+            assertEquals("tree://srt", completed.exportedSrtUri)
+
+            // failRecording preserves pointers/notes and keeps an existing
+            // transcript id when no replacement is supplied.
+            assertEquals(1, dao.failRecording("v5s", 1793975402000L, "codec died", null))
+            val failed = dao.getSessionById("v5s")!!
+            assertEquals("failed", failed.phase)
+            assertEquals("codec died", failed.errorMessage)
+            assertEquals("t9", failed.transcriptID)
+            assertEquals("kept notes", failed.manualNotes)
+            assertEquals("tree://audio", failed.exportedAudioUri)
         }
 
         db.close()

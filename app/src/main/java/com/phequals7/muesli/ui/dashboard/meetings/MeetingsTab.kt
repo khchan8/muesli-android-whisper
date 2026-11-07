@@ -258,7 +258,7 @@ fun MeetingsTab(
                     ) {
                         Text("Export recordings", color = colors.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                         Text(
-                            "Choose a recordings folder once so finished meetings save their WAV and SRT files where other apps can see them.",
+                            "Choose a recordings folder once so finished meetings save their audio (M4A) and SRT files where other apps can see them.",
                             color = colors.textSecondary,
                             fontSize = 12.sp
                         )

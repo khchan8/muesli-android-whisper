@@ -380,15 +380,15 @@ private fun MeetingsSettings(store: SharedStore) {
             )
             ToggleRow(
                 title = "Retain meeting audio",
-                subtitle = "Keeps the WAV file on device for future playback and speaker separation.",
+                subtitle = "Keeps the M4A audio file on device for future playback and speaker separation.",
                 checked = retainAudio,
                 onCheckedChange = { retainAudio = it; store.retainMeetingAudio = it }
             )
 
             Text("Recordings folder", color = colors.textPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
             Text(
-                folderLabel?.let { "WAV and SRT files are exported to $it." }
-                    ?: "Pick a folder once so finished meetings export their WAV and SRT files there. Until then they stay inside the app.",
+                folderLabel?.let { "Audio (M4A) and SRT files are exported to $it." }
+                    ?: "Pick a folder once so finished meetings export their audio and SRT files there. Until then they stay inside the app.",
                 color = colors.textSecondary,
                 fontSize = 11.sp,
                 lineHeight = 15.sp

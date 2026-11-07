@@ -276,7 +276,14 @@ class MeetingSummaryService : Service() {
                     title = title,
                 )
                 if (updated == 1) {
-                    MeetingStorageManager.syncRecordingArtifacts(applicationContext, store, sessionId)
+                    if (title != latest.title) {
+                        // Title change: full sync moves the owned audio name
+                        // first, then the subtitle follows.
+                        MeetingStorageManager.syncRecordingArtifacts(applicationContext, store, sessionId)
+                    } else {
+                        // Same title: only the SRT footer carries the summary.
+                        MeetingStorageManager.exportSrtArtifactOnly(applicationContext, store, sessionId)
+                    }
                 }
             } catch (ce: CancellationException) {
                 val message = ce.message?.takeIf { it.isNotBlank() } ?: CANCEL_MESSAGE

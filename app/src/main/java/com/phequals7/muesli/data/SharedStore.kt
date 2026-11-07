@@ -217,6 +217,9 @@ class SharedStore(private val context: Context) {
     suspend fun updateRecordingExportError(sessionId: String, message: String?): Int =
         recordingSessionDao.updateExportError(sessionId, message)
 
+    suspend fun clearAudioExportError(sessionId: String): Int =
+        recordingSessionDao.clearAudioExportError(sessionId)
+
     // Transcripts
     fun getTranscriptForSessionFlow(sessionId: String): Flow<Transcript?> = transcriptDao.getTranscriptForSessionFlow(sessionId)
     suspend fun getTranscriptForSession(sessionId: String): Transcript? = transcriptDao.getTranscriptForSession(sessionId)
@@ -233,12 +236,24 @@ class SharedStore(private val context: Context) {
     suspend fun replaceTranscriptSegments(sessionId: String, segments: List<MeetingTranscriptSegmentEntity>, inlineText: String) =
         transcriptSegmentDao.replaceSegmentsForSession(sessionId, segments, inlineText)
 
-    suspend fun updateRecordingExportUris(
+    suspend fun markRecordingStopped(sessionId: String, endedAt: Long, audioFileName: String?): Int =
+        recordingSessionDao.markRecordingStopped(sessionId, endedAt, audioFileName)
+
+    suspend fun completeRecording(sessionId: String, transcriptId: String): Int =
+        recordingSessionDao.completeRecording(sessionId, transcriptId)
+
+    suspend fun updateExportedAudioUri(sessionId: String, expectedAudioPath: String?, audioUri: String): Int =
+        recordingSessionDao.updateExportedAudioUri(sessionId, expectedAudioPath, audioUri)
+
+    suspend fun updateExportedSrtUri(
         sessionId: String,
         expectedAudioPath: String?,
-        wavUri: String,
+        expectedAudioUri: String,
         srtUri: String
-    ): Int = recordingSessionDao.updateRecordingExportUris(sessionId, expectedAudioPath, wavUri, srtUri)
+    ): Int = recordingSessionDao.updateExportedSrtUri(sessionId, expectedAudioPath, expectedAudioUri, srtUri)
+
+    suspend fun failRecording(sessionId: String, endedAt: Long, message: String, transcriptId: String?): Int =
+        recordingSessionDao.failRecording(sessionId, endedAt, message, transcriptId)
 
     suspend fun getSessionsWithGeneratingSummary(): List<com.phequals7.muesli.data.dao.SummaryGeneratingRow> =
         recordingSessionDao.getSessionsWithGeneratingSummary()

@@ -1,7 +1,10 @@
 package com.phequals7.muesli.meetings
 
 import android.content.Context
+import android.media.MediaExtractor
+import android.media.MediaFormat
 import android.net.Uri
+import android.os.Environment
 import android.provider.DocumentsContract
 import android.util.Log
 import kotlinx.coroutines.CancellationException
@@ -22,21 +25,23 @@ import java.util.Locale
 import java.util.UUID
 
 /**
- * Private `/data/data/…/files/meetings` WAV + SRT artifact pairs with
- * title-driven naming, plus paired export into the user-granted recordings
- * folder (SAF tree). Legacy public `/sdcard/Recordings/Muesli` files stay
- * readable where they are — nothing is migrated or deleted for migration's
- * sake.
- *
- * Retained recordings are stored as `<safe-title>_<startedAt timestamp>.wav`
- * with an identically named `.srt` beside them.
+ * Private `/data/data/…/files/meetings` audio + SRT artifacts with
+ * title-driven naming, plus two-stage export into the user-granted
+ * recordings folder (SAF tree): Stage 1 publishes the retained audio
+ * (`.m4a`, or legacy `.wav`) as soon as capture stops; Stage 2 publishes
+ * the `.srt` after the final transcript/segments are persisted. Legacy
+ * public `/sdcard/Recordings/Muesli` files stay readable where they are —
+ * nothing is migrated or transcoded for migration's sake.
  */
 object MeetingStorageManager {
     private const val TAG = "MeetingStorageManager"
     const val EXPORT_ERROR_PREFIX = "Recording export failed:"
-    const val CHOOSE_FOLDER_ERROR = "$EXPORT_ERROR_PREFIX Choose a recordings folder to save WAV and SRT."
+    const val AUDIO_STAGE_ERROR_PREFIX = "$EXPORT_ERROR_PREFIX Audio:"
+    const val SRT_STAGE_ERROR_PREFIX = "$EXPORT_ERROR_PREFIX SRT:"
     private const val MIME_WAV = "audio/wav"
+    private const val MIME_M4A = "audio/mp4"
     private const val MIME_SRT = "application/x-subrip"
+    private const val EXTERNAL_STORAGE_AUTHORITY = "com.android.externalstorage.documents"
 
     /** Serializes every artifact write/rename in the process. */
     private val artifactMutex = Mutex()
@@ -82,81 +87,110 @@ object MeetingStorageManager {
     }
 
     /**
-     * Reserves a collision-free `.wav` (checking both `.wav` and `.srt`
+     * Reserves a collision-free `.m4a` (checking `.m4a`, `.wav`, and `.srt`
      * candidates) named after the recording start time, and returns it.
      */
-    fun createSessionWavFile(directory: File, title: String?, startedAtMs: Long): File {
+    fun createSessionAudioFile(directory: File, title: String?, startedAtMs: Long): File {
         directory.mkdirs()
         val base = recordingBaseName(title, startedAtMs)
         var attempt = 1
         while (true) {
             val stem = if (attempt == 1) base else "${base}_$attempt"
-            val wav = File(directory, "$stem.wav")
-            // Both extensions must be free so the SRT sidecar can share the stem.
-            if (!wav.exists() && !File(directory, "$stem.srt").exists() && wav.createNewFile()) return wav
+            val audio = File(directory, "$stem.m4a")
+            // All three extensions must be free so the SRT sidecar can share the stem.
+            if (!audio.exists() && !File(directory, "$stem.wav").exists() &&
+                !File(directory, "$stem.srt").exists() && audio.createNewFile()
+            ) return audio
             attempt++
         }
     }
 
     /** Resolves a stored [com.phequals7.muesli.data.entity.RecordingSession.audioFileName] to a file. */
-    fun resolveRecordingWav(filesDir: File, audioFileName: String?): File? {
+    fun resolveRecordingAudio(filesDir: File, audioFileName: String?): File? {
         val name = audioFileName?.takeIf { it.isNotBlank() } ?: return null
         return if (name.startsWith("/")) File(name) else File(filesDir, "meetings/$name")
     }
 
-    /** Result of one private artifact synchronization pass. */
+    /** A usable retained audio file: a nonempty regular file; legacy WAVs
+     *  additionally need a data payload beyond the 44-byte header. */
+    internal fun isUsableAudioFile(file: File): Boolean {
+        if (!file.isFile || file.length() <= 0L) return false
+        if (!file.name.endsWith(".wav", ignoreCase = true)) return true
+        return file.length() > 44L
+    }
+
+    /** A finalized M4A is exportable only when it exposes a readable AAC track. */
+    internal fun hasReadableAacTrack(file: File): Boolean {
+        val extractor = MediaExtractor()
+        return try {
+            extractor.setDataSource(file.absolutePath)
+            (0 until extractor.trackCount).any { i ->
+                extractor.getTrackFormat(i).getString(MediaFormat.KEY_MIME) == MediaFormat.MIMETYPE_AUDIO_AAC
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "M4A validation failed for ${file.name}: ${t.message}")
+            false
+        } finally {
+            runCatching { extractor.release() }
+        }
+    }
+
+    /** Result of one private artifact normalization pass. */
     internal data class SyncOutcome(
-        /** Absolute path of the (possibly renamed) WAV after the pass. */
-        val wavPath: String?,
+        /** Absolute path of the (possibly renamed) audio file after the pass. */
+        val audioPath: String?,
         /** Export failure text starting with [EXPORT_ERROR_PREFIX], or null. */
         val exportError: String?
     )
 
     /**
-     * Ensures a completed session's retained WAV has a matching SRT sidecar and
-     * a title-driven `<title>_<startedAt>` basename, then updates Room's
-     * `audioFileName` only after the new pair is durable. The DB commit AND
-     * the source cleanup both run in [NonCancellable] so a cancellation
-     * delivered right after the commit can never strand the new pair or
-     * delete it after the DB already points at it.
+     * Normalizes the retained audio file to a title-driven
+     * `<title>_<startedAt>` basename in [targetDirectory] and updates Room's
+     * `audioFileName` only after the new file is durable. An existing private
+     * SRT sidecar is copied to the new stem (never created when absent — new
+     * subtitle content is Stage 2's job). The DB commit AND the source
+     * cleanup both run in [NonCancellable] so a cancellation delivered right
+     * after the commit can never strand the new pair or delete it after the
+     * DB already points at it.
      */
     internal suspend fun syncSessionArtifacts(
         sessionId: String,
         title: String,
         startedAtMs: Long,
-        sourceWav: File,
-        srtContent: String?,
+        sourceAudio: File,
         targetDirectory: File,
         storedAudioPath: String?,
         commitPath: suspend (expectedOldPath: String?, newPath: String) -> Boolean
     ): SyncOutcome {
         val desiredStem = recordingBaseName(title, startedAtMs)
-        val sourceSrt = File(sourceWav.parentFile, sourceWav.nameWithoutExtension + ".srt")
+        val extension = sourceAudio.name.substringAfterLast('.', "").lowercase(Locale.US)
+        val sourceSrt = File(sourceAudio.parentFile, sourceAudio.nameWithoutExtension + ".srt")
 
-        val currentStem = sourceWav.nameWithoutExtension
+        val currentStem = sourceAudio.nameWithoutExtension
         val stableStem = currentStem == desiredStem ||
             currentStem.removePrefix("${desiredStem}_").let { it != currentStem && it.toIntOrNull()?.let { n -> n >= 2 } == true }
-        val needsRename = !stableStem || sourceWav.parentFile != targetDirectory
-        if (srtContent == null) {
-            Log.i(TAG, "No timed segments for $sessionId; keeping audio without an SRT sidecar")
-        }
+        val needsRename = !stableStem || sourceAudio.parentFile != targetDirectory
 
-        // Free stem in the target directory for both .wav and .srt; collision
-        // suffixes _2, _3, ... never overwrite an existing file. The source's
-        // own stem is not a conflict (we own it), so repeated syncs of an
-        // already-suffixed pair stay stable instead of drifting to _3, _4…
+        // Free stem in the target directory for the audio and its sidecar;
+        // collision suffixes _2, _3, ... never overwrite an existing file.
+        // The source's own stem is not a conflict (we own it), so repeated
+        // syncs of an already-suffixed file stay stable instead of drifting.
         var stem = desiredStem
         var attempt = 1
         if (needsRename) {
-            while (stem != sourceWav.nameWithoutExtension &&
-                (File(targetDirectory, "$stem.wav").exists() || File(targetDirectory, "$stem.srt").exists())
+            while (stem != sourceAudio.nameWithoutExtension &&
+                (targetDirectory.listFiles()?.map { it.name } ?: emptyList()).let { names ->
+                    names.any { it == "$stem.$extension" || it == "$stem.srt" ||
+                        it == "$stem.m4a" || it == "$stem.wav" }
+                }
             ) {
                 attempt++
                 stem = "${desiredStem}_$attempt"
             }
         }
 
-        val newWav = if (needsRename) File(targetDirectory, "$stem.wav") else sourceWav
+        val newName = if (extension.isEmpty()) stem else "$stem.$extension"
+        val newAudio = if (needsRename) File(targetDirectory, newName) else sourceAudio
         val newSrt = if (needsRename) File(targetDirectory, "$stem.srt") else sourceSrt
 
         val created = mutableListOf<File>()
@@ -164,23 +198,23 @@ object MeetingStorageManager {
         try {
             if (needsRename) {
                 targetDirectory.mkdirs()
-                copyAndSync(sourceWav, newWav)
-                created.add(newWav)
-                check(newWav.length() == sourceWav.length()) { "Incomplete recording copy" }
-            }
-            if (srtContent != null) {
-                writeSrtAtomically(newSrt, srtContent)
-                created.add(newSrt)
+                copyAndSync(sourceAudio, newAudio)
+                created.add(newAudio)
+                check(newAudio.length() == sourceAudio.length()) { "Incomplete recording copy" }
+                if (sourceSrt.exists()) {
+                    copyAndSync(sourceSrt, newSrt)
+                    created.add(newSrt)
+                }
             }
 
             // Commit phase: the guarded DB update and the source cleanup form
             // one non-cancellable unit — after the commit succeeds the new
-            // pair can no longer be deleted by cancellation or a later error.
+            // files can no longer be deleted by cancellation or a later error.
             val expectedOldPath = if (needsRename) storedAudioPath else null
             withContext(NonCancellable) {
-                committed = commitPath(expectedOldPath, newWav.absolutePath)
+                committed = commitPath(expectedOldPath, newAudio.absolutePath)
                 if (committed && needsRename) {
-                    if (!sourceWav.delete()) Log.w(TAG, "Could not remove original ${sourceWav.absolutePath}")
+                    if (!sourceAudio.delete()) Log.w(TAG, "Could not remove original ${sourceAudio.absolutePath}")
                     if (sourceSrt.exists() && !sourceSrt.delete()) {
                         Log.w(TAG, "Could not remove original ${sourceSrt.absolutePath}")
                     }
@@ -190,23 +224,23 @@ object MeetingStorageManager {
                 if (!committed) {
                     // Room row vanished or its path changed underneath us: keep
                     // the source pair, remove only what this pass created.
-                    created.forEach { if (it != sourceWav && it != sourceSrt) it.delete() }
-                    return SyncOutcome(sourceWav.absolutePath, null)
+                    created.forEach { if (it != sourceAudio && it != sourceSrt) it.delete() }
+                    return SyncOutcome(sourceAudio.absolutePath, null)
                 }
             }
-            return SyncOutcome(newWav.absolutePath, null)
+            return SyncOutcome(newAudio.absolutePath, null)
         } catch (e: CancellationException) {
-            if (!committed) created.forEach { if (it != sourceWav && it != sourceSrt) it.delete() }
+            if (!committed) created.forEach { if (it != sourceAudio && it != sourceSrt) it.delete() }
             throw e
         } catch (e: Exception) {
-            Log.e(TAG, "Recording export failed for $sessionId", e)
-            if (!committed) created.forEach { if (it != sourceWav && it != sourceSrt) it.delete() }
-            return SyncOutcome(sourceWav.absolutePath, "$EXPORT_ERROR_PREFIX ${e.message ?: e.javaClass.simpleName}")
+            Log.e(TAG, "Recording normalization failed for $sessionId", e)
+            if (!committed) created.forEach { if (it != sourceAudio && it != sourceSrt) it.delete() }
+            return SyncOutcome(sourceAudio.absolutePath, "$EXPORT_ERROR_PREFIX ${e.message ?: e.javaClass.simpleName}")
         }
     }
 
     /** Reserves [dest] exclusively (atomic create), then copies + fsyncs so
-     *  the WAV is durable before commit. */
+     *  the file is durable before commit. */
     private fun copyAndSync(source: File, dest: File) {
         check(dest.createNewFile()) { "Destination ${dest.name} already exists" }
         try {
@@ -227,7 +261,7 @@ object MeetingStorageManager {
      * truncating fallback: a failed rename keeps the old sidecar intact and
      * surfaces an error instead.
      */
-    private fun writeSrtAtomically(target: File, content: String) {
+    internal fun writeSrtAtomically(target: File, content: String) {
         val tmp = File(target.parentFile, ".${target.name}.${UUID.randomUUID()}.tmp")
         try {
             FileOutputStream(tmp).use { out ->
@@ -243,113 +277,329 @@ object MeetingStorageManager {
         }
     }
 
+    // ── staged export entry points ───────────────────────────────────────
+
     /**
-     * Lazily synchronizes one session's artifacts: normalizes the private
-     * WAV/SRT pair (title-driven basename) and exports the pair into the
-     * granted recordings folder. Returns an export error message (for
-     * `RecordingSession.errorMessage`) or null on success.
+     * Full retry: normalizes private artifacts, runs the audio stage, then —
+     * only for completed sessions — the SRT stage. Holds [artifactMutex]
+     * once so the whole pass is atomic against stage entry points.
      */
     suspend fun syncRecordingArtifacts(context: Context, store: com.phequals7.muesli.data.SharedStore, sessionId: String): Unit =
         artifactMutex.withLock {
             withContext(Dispatchers.IO) {
+                if (!runAudioStage(context, store, sessionId)) return@withContext
                 val session = store.getRecordingSessionById(sessionId) ?: return@withContext
-                if (session.phase != "completed" || session.audioFileName.isNullOrBlank()) return@withContext
-                val sourceWav = resolveRecordingWav(context.filesDir, session.audioFileName)
-                    ?.takeIf { it.exists() && it.length() > 44L }
-                if (sourceWav == null) {
-                    store.updateRecordingExportError(sessionId, "$EXPORT_ERROR_PREFIX Recording audio is missing.")
-                    return@withContext
-                }
-
-                val segments = store.getTranscriptSegments(sessionId)
-                val transcriptText = store.getTranscriptForSession(sessionId)?.text.orEmpty()
-                // Legacy flat transcript without timed cues: preserve audio and report
-                // that an accurate SRT cannot be created; never fabricate timestamps.
-                val noTimedCuesError = if (segments.isEmpty() && transcriptText.isNotBlank()) {
-                    "$EXPORT_ERROR_PREFIX Accurate SRT subtitles cannot be created because this legacy recording has no timed cues."
-                } else {
-                    null
-                }
-                val durationMs = runCatching {
-                    android.media.MediaMetadataRetriever().let { retriever ->
-                        try {
-                            retriever.setDataSource(sourceWav.absolutePath)
-                            retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
-                        } finally {
-                            retriever.release()
-                        }
-                    }
-                }.getOrDefault(0L)
-                val srtContent = if (noTimedCuesError != null) null else MeetingTranscriptSrt.serialize(
-                    segments.map { it.toDomainModel() },
-                    manualNotes = session.manualNotes,
-                    summary = session.summaryText.takeUnless { it.startsWith("## Summary failed\n") }.orEmpty(),
-                    audioDurationMs = maxOf(durationMs, (session.endedAt ?: 0L) - (session.startedAt ?: 0L)),
-                )
-
-                // 1. Private pair: normalize the basename in the WAV's own
-                //    directory (files/meetings for new recordings; legacy
-                //    public files stay in place, readable, never migrated).
-                val targetDir = sourceWav.parentFile ?: internalRecordingsDirectory(context.filesDir)
-                val privateOutcome = syncSessionArtifacts(
-                    sessionId = sessionId,
-                    title = session.title,
-                    startedAtMs = session.startedAt ?: session.createdAt,
-                    sourceWav = sourceWav,
-                    srtContent = srtContent,
-                    targetDirectory = targetDir,
-                    storedAudioPath = session.audioFileName,
-                    commitPath = { expectedOld, newPath ->
-                        if (expectedOld != null) {
-                            store.updateRecordingAudioPath(sessionId, expectedOld, newPath) == 1
-                        } else {
-                            true
-                        }
-                    }
-                )
-
-                var error: String? = privateOutcome.exportError
-
-                // 2. Public export through the granted folder.
-                if (error == null) {
-                    val refreshed = store.getRecordingSessionById(sessionId) ?: return@withContext
-                    val refreshedWav = resolveRecordingWav(context.filesDir, refreshed.audioFileName)
-                    val treeUriStr = store.recordingsTreeUri
-                    if (treeUriStr.isBlank()) {
-                        error = noTimedCuesError ?: CHOOSE_FOLDER_ERROR
-                    } else if (refreshedWav != null && refreshedWav.exists() && refreshedWav.length() > 44L) {
-                        try {
-                            val treeUri = Uri.parse(treeUriStr)
-                            val gateway = ContentResolverTreeGateway(context.applicationContext, treeUri)
-                            val export = exportPairToTree(
-                                gateway = gateway,
-                                sessionId = sessionId,
-                                desiredStem = recordingBaseName(refreshed.title, refreshed.startedAt ?: refreshed.createdAt),
-                                sourceWav = refreshedWav,
-                                srtContent = srtContent,
-                                ownedWavUri = refreshed.exportedWavUri,
-                                ownedSrtUri = refreshed.exportedSrtUri,
-                                commitUris = { wavUri, srtUri ->
-                                    store.updateRecordingExportUris(sessionId, refreshed.audioFileName, wavUri, srtUri) == 1
-                                }
-                            )
-                            error = export.exportError ?: export.cleanupError ?: noTimedCuesError
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (e: Exception) {
-                            error = "$EXPORT_ERROR_PREFIX ${e.message ?: "Unable to access the recordings folder."}"
-                        }
-                    }
-                }
-
-                if (error != null) {
-                    store.updateRecordingExportError(sessionId, error)
-                } else {
-                    // A successful full export clears a previous export error only.
-                    store.updateRecordingExportError(sessionId, null)
+                if (session.phase == "completed") {
+                    runSrtStage(context, store, sessionId)
                 }
             }
         }
+
+    /**
+     * Stage 1: publish the retained audio (private normalization + public
+     * export into the granted folder) while transcription is still running.
+     * Accepts `transcribing` and `completed` sessions. No retained audio is
+     * a successful no-op; a deleted row or stale guard returns false without
+     * creating anything. Never reads segments or creates an SRT.
+     */
+    suspend fun exportAudioArtifactImmediately(
+        context: Context,
+        store: com.phequals7.muesli.data.SharedStore,
+        sessionId: String
+    ): Boolean = artifactMutex.withLock {
+        withContext(Dispatchers.IO) { runAudioStage(context, store, sessionId) }
+    }
+
+    /**
+     * Stage 2: (re)write the private SRT sidecar and publish it beside the
+     * committed public audio. Runs only for `completed` sessions after the
+     * final segments/notes are persisted; never copies, renames, or exports
+     * audio.
+     */
+    suspend fun exportSrtArtifactOnly(
+        context: Context,
+        store: com.phequals7.muesli.data.SharedStore,
+        sessionId: String
+    ): Boolean = artifactMutex.withLock {
+        withContext(Dispatchers.IO) { runSrtStage(context, store, sessionId) }
+    }
+
+    private fun audioStageError(detail: String): String = "$AUDIO_STAGE_ERROR_PREFIX $detail"
+    private fun srtStageError(detail: String): String = "$SRT_STAGE_ERROR_PREFIX $detail"
+
+    /** Audio stage; caller holds [artifactMutex] and is on Dispatchers.IO. */
+    private suspend fun runAudioStage(
+        context: Context,
+        store: com.phequals7.muesli.data.SharedStore,
+        sessionId: String
+    ): Boolean {
+        val session = store.getRecordingSessionById(sessionId)
+            ?: return false
+        if (session.phase != "transcribing" && session.phase != "completed") return false
+        if (session.audioFileName.isNullOrBlank()) return true // no retention: successful no-op
+
+        val sourceAudio = resolveRecordingAudio(context.filesDir, session.audioFileName)
+            ?.takeIf { isUsableAudioFile(it) }
+        if (sourceAudio == null) {
+            store.updateRecordingExportError(sessionId, audioStageError("Recording audio is missing."))
+            return false
+        }
+        if (sourceAudio.name.endsWith(".m4a", ignoreCase = true) && !hasReadableAacTrack(sourceAudio)) {
+            store.updateRecordingExportError(sessionId, audioStageError("The recording's M4A audio could not be verified."))
+            return false
+        }
+
+        // 1. Private normalization: title-driven basename in the audio's own
+        //    directory (files/meetings for new recordings; legacy public files
+        //    stay in place, readable, never migrated).
+        val targetDir = sourceAudio.parentFile ?: internalRecordingsDirectory(context.filesDir)
+        val outcome = syncSessionArtifacts(
+            sessionId = sessionId,
+            title = session.title,
+            startedAtMs = session.startedAt ?: session.createdAt,
+            sourceAudio = sourceAudio,
+            targetDirectory = targetDir,
+            storedAudioPath = session.audioFileName,
+            commitPath = { expectedOld, newPath ->
+                if (expectedOld != null) {
+                    store.updateRecordingAudioPath(sessionId, expectedOld, newPath) == 1
+                } else {
+                    true
+                }
+            }
+        )
+        if (outcome.exportError != null) {
+            store.updateRecordingExportError(sessionId, withAudioStagePrefix(outcome.exportError))
+            return false
+        }
+
+        // 2. Public export through the granted folder.
+        val refreshed = store.getRecordingSessionById(sessionId) ?: return false
+        val audio = resolveRecordingAudio(context.filesDir, refreshed.audioFileName)
+            ?.takeIf { isUsableAudioFile(it) }
+        if (audio == null) {
+            store.updateRecordingExportError(sessionId, audioStageError("Recording audio is missing."))
+            return false
+        }
+        val treeUriStr = store.recordingsTreeUri
+        if (treeUriStr.isBlank()) {
+            store.updateRecordingExportError(sessionId, CHOOSE_FOLDER_AUDIO_ERROR)
+            return false
+        }
+        return try {
+            val gateway = ContentResolverTreeGateway(context.applicationContext, Uri.parse(treeUriStr))
+            val export = exportAudioToTree(
+                gateway = gateway,
+                sessionId = sessionId,
+                desiredStem = recordingBaseName(refreshed.title, refreshed.startedAt ?: refreshed.createdAt),
+                sourceAudio = audio,
+                ownedAudioUri = refreshed.exportedAudioUri,
+                ownedSrtUri = refreshed.exportedSrtUri,
+                commitUri = { audioUri ->
+                    store.updateExportedAudioUri(sessionId, refreshed.audioFileName, audioUri) == 1
+                }
+            )
+            val error = export.exportError ?: export.cleanupError
+            if (error != null) {
+                store.updateRecordingExportError(sessionId, withAudioStagePrefix(error))
+                false
+            } else if (export.uri == null) {
+                // Stale guard or a row deleted mid-flight: nothing committed,
+                // and nothing this stage owns was left behind.
+                false
+            } else {
+                requestMediaScan(context, export.uri, publicAudioMime(audio))
+                store.clearAudioExportError(sessionId)
+                true
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Audio export failed for $sessionId", e)
+            store.updateRecordingExportError(
+                sessionId,
+                audioStageError(e.message ?: "Unable to access the recordings folder.")
+            )
+            false
+        }
+    }
+
+    /** SRT stage; caller holds [artifactMutex] and is on Dispatchers.IO. */
+    private suspend fun runSrtStage(
+        context: Context,
+        store: com.phequals7.muesli.data.SharedStore,
+        sessionId: String
+    ): Boolean {
+        val session = store.getRecordingSessionById(sessionId) ?: return false
+        if (session.phase != "completed") return false
+        if (session.audioFileName.isNullOrBlank()) return true // nothing retained: no-op
+
+        // Unverified/missing audio keeps a prior Audio: stage error untouched
+        // (full retry owns fixing it) and only reports when no audio error exists.
+        suspend fun retainAudioErrorAndFail(detail: String): Boolean {
+            val current = session.errorMessage
+            if (current == null || !current.startsWith(AUDIO_STAGE_ERROR_PREFIX)) {
+                store.updateRecordingExportError(sessionId, srtStageError(detail))
+            }
+            return false
+        }
+
+        val segments = store.getTranscriptSegments(sessionId)
+        val transcriptText = store.getTranscriptForSession(sessionId)?.text.orEmpty()
+        // Legacy flat transcript without timed cues: preserve audio and report
+        // that an accurate SRT cannot be created; never fabricate timestamps.
+        if (segments.isEmpty() && transcriptText.isNotBlank()) {
+            store.updateRecordingExportError(
+                sessionId,
+                srtStageError("Accurate SRT subtitles cannot be created because this legacy recording has no timed cues.")
+            )
+            return false
+        }
+
+        val sourceAudio = resolveRecordingAudio(context.filesDir, session.audioFileName)
+            ?.takeIf { isUsableAudioFile(it) }
+        if (sourceAudio == null) {
+            return retainAudioErrorAndFail("Recording audio is missing. Retry the full export.")
+        }
+
+        val durationMs = readAudioDurationMs(sourceAudio)
+        val srtContent = MeetingTranscriptSrt.serialize(
+            segments.map { it.toDomainModel() },
+            manualNotes = session.manualNotes,
+            summary = session.summaryText.takeUnless { it.startsWith("## Summary failed\n") }.orEmpty(),
+            audioDurationMs = maxOf(durationMs, (session.endedAt ?: 0L) - (session.startedAt ?: 0L)),
+        )
+
+        // 1. Private sidecar is always refreshed, even without a public folder.
+        try {
+            writeSrtAtomically(
+                File(sourceAudio.parentFile, sourceAudio.nameWithoutExtension + ".srt"),
+                srtContent
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Private SRT write failed for $sessionId", e)
+            store.updateRecordingExportError(sessionId, srtStageError(e.message ?: e.javaClass.simpleName))
+            return false
+        }
+
+        // 2. Public SRT beside the committed audio document.
+        val treeUriStr = store.recordingsTreeUri
+        if (treeUriStr.isBlank()) {
+            store.updateRecordingExportError(sessionId, CHOOSE_FOLDER_SRT_ERROR)
+            return false
+        }
+        val ownedAudioUri = session.exportedAudioUri?.takeIf { it.isNotBlank() }
+        if (ownedAudioUri == null) {
+            return retainAudioErrorAndFail("The audio file must be exported first. Retry the full export.")
+        }
+        return try {
+            val gateway = ContentResolverTreeGateway(context.applicationContext, Uri.parse(treeUriStr))
+            if (!gateway.isInTree(ownedAudioUri)) {
+                return retainAudioErrorAndFail("The exported audio file is no longer in the recordings folder. Retry the full export.")
+            }
+            val audioName = gateway.queryDisplayName(ownedAudioUri)
+                ?: return retainAudioErrorAndFail("The exported audio file is no longer readable. Retry the full export.")
+            val desiredStem = recordingBaseName(session.title, session.startedAt ?: session.createdAt)
+            val ownedStem = audioName.substringBeforeLast('.')
+            val suffix = ownedStem.removePrefix("${desiredStem}_")
+            val stemMatches = ownedStem == desiredStem ||
+                (suffix != ownedStem && suffix.toIntOrNull()?.let { it >= 2 } == true)
+            if (!stemMatches) {
+                return retainAudioErrorAndFail("The exported audio name no longer matches this meeting. Retry the full export.")
+            }
+
+            val export = exportSrtToTree(
+                gateway = gateway,
+                sessionId = sessionId,
+                audioUri = ownedAudioUri,
+                srtContent = srtContent,
+                ownedSrtUri = session.exportedSrtUri,
+                commitUri = { srtUri ->
+                    store.updateExportedSrtUri(sessionId, session.audioFileName, ownedAudioUri, srtUri) == 1
+                }
+            )
+            val error = export.exportError ?: export.cleanupError
+            if (error != null) {
+                store.updateRecordingExportError(sessionId, withSrtStagePrefix(error))
+                false
+            } else if (export.uri == null) {
+                false
+            } else {
+                requestMediaScan(context, export.uri, MIME_SRT)
+                // Both stages verified: a successful subtitle commit may clear
+                // any prior export error.
+                store.updateRecordingExportError(sessionId, null)
+                true
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "SRT export failed for $sessionId", e)
+            store.updateRecordingExportError(
+                sessionId,
+                srtStageError(e.message ?: "Unable to access the recordings folder.")
+            )
+            false
+        }
+    }
+
+    private fun withAudioStagePrefix(error: String): String =
+        "$AUDIO_STAGE_ERROR_PREFIX ${error.removePrefix(EXPORT_ERROR_PREFIX).trim()}"
+
+    private fun withSrtStagePrefix(error: String): String =
+        "$SRT_STAGE_ERROR_PREFIX ${error.removePrefix(EXPORT_ERROR_PREFIX).trim()}"
+
+    /** Chooses a recordings-folder guidance message for each stage. */
+    const val CHOOSE_FOLDER_AUDIO_ERROR = "$AUDIO_STAGE_ERROR_PREFIX Choose a recordings folder to save the audio."
+    const val CHOOSE_FOLDER_SRT_ERROR = "$SRT_STAGE_ERROR_PREFIX Choose a recordings folder to save audio and SRT."
+
+    private fun publicAudioMime(audio: File): String =
+        if (audio.name.endsWith(".wav", ignoreCase = true)) MIME_WAV else MIME_M4A
+
+    private fun readAudioDurationMs(audio: File): Long = runCatching {
+        android.media.MediaMetadataRetriever().let { retriever ->
+            try {
+                retriever.setDataSource(audio.absolutePath)
+                retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+            } finally {
+                retriever.release()
+            }
+        }
+    }.getOrDefault(0L)
+
+    /**
+     * Requests a MediaStore scan using the document's actual public path,
+     * for local ExternalStorageProvider documents only. SAF creation and
+     * verified bytes already establish export success, so a null scanner
+     * callback can never fail or roll back the export.
+     */
+    private fun requestMediaScan(context: Context, documentUri: String, mime: String) {
+        val path = localDocumentPath(documentUri) ?: return
+        android.media.MediaScannerConnection.scanFile(context, arrayOf(path), arrayOf(mime)) { _, _ -> }
+    }
+
+    /** Actual public filesystem path for `primary:` ExternalStorageProvider
+     *  documents, with canonical containment checks; null otherwise. */
+    internal fun localDocumentPath(documentUri: String): String? = try {
+        val uri = Uri.parse(documentUri)
+        if (uri.authority != EXTERNAL_STORAGE_AUTHORITY) return null
+        val docId = DocumentsContract.getDocumentId(uri)
+        val separator = docId.indexOf(':')
+        if (separator <= 0) return null
+        if (docId.substring(0, separator) != "primary") return null
+        val relative = docId.substring(separator + 1)
+        if (relative.isBlank() || relative.contains("..")) return null
+        val root = Environment.getExternalStorageDirectory()
+        val canonical = File(root, relative).canonicalFile
+        val canonicalRoot = root.canonicalFile
+        val contained = canonical == canonicalRoot ||
+            canonical.path.startsWith(canonicalRoot.path + File.separator)
+        if (contained) canonical.path else null
+    } catch (t: Throwable) {
+        null
+    }
 
     // ── SAF tree export ──────────────────────────────────────────────────
 
@@ -377,128 +627,178 @@ object MeetingStorageManager {
         fun deleteDocument(documentUri: String): Boolean
     }
 
-    internal data class TreeExportOutcome(
-        val wavUri: String?,
-        val srtUri: String?,
+    internal data class ArtifactExportOutcome(
+        val uri: String?,
         val exportError: String?,
         val cleanupError: String?,
     )
 
     /**
-     * Creates (or refreshes) the paired WAV/SRT documents named
-     * `<desiredStem>.wav|.srt` in the tree, verifies display names and byte
-     * lengths, commits both URIs together through the guarded [commitUris],
-     * and only then deletes the superseded owned documents. Attempt-owned
-     * documents are removed on any pre-commit failure; the committed pair is
-     * never deleted afterwards.
+     * Stage 1 pure SAF export: creates (or reuses the owned) audio document
+     * named `<desiredStem>.m4a|.wav` in the tree — a stem whose `.m4a`,
+     * `.wav`, or `.srt` name is free — verifies the byte length, and commits
+     * only the audio URI through the guarded [commitUri]. A matching owned
+     * document is reused without rewriting (byte-length comparison) and does
+     * not depend on owning an SRT. Any superseded audio document is deleted
+     * only after the replacement URI is committed; the old SRT is never
+     * touched here — Stage 2 replaces it. Attempt-owned documents are
+     * removed on any pre-commit failure; the committed document is never
+     * deleted afterwards.
      */
-    internal suspend fun exportPairToTree(
+    internal suspend fun exportAudioToTree(
         gateway: RecordingTreeGateway,
         sessionId: String,
         desiredStem: String,
-        sourceWav: File,
-        srtContent: String?,
-        ownedWavUri: String?,
+        sourceAudio: File,
+        ownedAudioUri: String?,
         ownedSrtUri: String?,
-        commitUris: suspend (wavUri: String, srtUri: String) -> Boolean,
-    ): TreeExportOutcome {
-        val ownedWav = ownedWavUri?.takeIf { it.isNotBlank() }
-        val ownedSrt = ownedSrtUri?.takeIf { it.isNotBlank() }
-        val ownedWavName = ownedWav?.let { gateway.queryDisplayName(it) }.orEmpty()
-        val ownedStem = ownedWavName.removeSuffix(".wav")
+        commitUri: suspend (audioUri: String) -> Boolean,
+    ): ArtifactExportOutcome {
+        val ext = if (sourceAudio.name.endsWith(".wav", ignoreCase = true)) "wav" else "m4a"
+        val mime = if (ext == "wav") MIME_WAV else MIME_M4A
+        val ownedAudio = ownedAudioUri?.takeIf { it.isNotBlank() }
+        val ownedAudioName = ownedAudio?.let { gateway.queryDisplayName(it) }.orEmpty()
+        val ownedStem = ownedAudioName.removeSuffix(".$ext")
         val suffix = ownedStem.removePrefix("${desiredStem}_")
         val matchingStem = ownedStem == desiredStem ||
             (suffix != ownedStem && suffix.toIntOrNull()?.let { it >= 2 } == true)
-        val reuseOwned = ownedWav != null && ownedSrt != null &&
-            gateway.isInTree(ownedWav) && gateway.isInTree(ownedSrt) &&
-            ownedWavName == "$ownedStem.wav" && matchingStem &&
-            gateway.queryDisplayName(ownedSrt) == "$ownedStem.srt"
+        val reuseOwned = ownedAudio != null && gateway.isInTree(ownedAudio) &&
+            ownedAudioName == "$ownedStem.$ext" && matchingStem
 
         val created = mutableListOf<String>()
-        var committedPair = false
+        var committed = false
         try {
-            val wavUri: String
-            val srtUri: String?
+            val audioUri: String
             if (reuseOwned) {
-                wavUri = ownedWav!!
-                srtUri = ownedSrt.takeIf { srtContent != null }
+                audioUri = ownedAudio!!
             } else {
                 val names = gateway.childDocumentNames()
                 var stem = desiredStem
                 var attempt = 1
-                while ("$stem.wav" in names || "$stem.srt" in names) {
+                while ("$stem.m4a" in names || "$stem.wav" in names || "$stem.srt" in names) {
                     attempt++
                     stem = "${desiredStem}_$attempt"
                 }
-                wavUri = gateway.createDocument(MIME_WAV, "$stem.wav")
+                audioUri = gateway.createDocument(mime, "$stem.$ext")
                     .also { created.add(it) }
-                if (gateway.queryDisplayName(wavUri) != "$stem.wav") {
-                    throw java.io.IOException("Provider created an unexpected WAV name")
-                }
-                srtUri = if (srtContent != null) {
-                    gateway.createDocument(MIME_SRT, "$stem.srt")
-                        .also { created.add(it) }
-                        .also {
-                            if (gateway.queryDisplayName(it) != "$stem.srt") {
-                                throw java.io.IOException("Provider created an unexpected SRT name")
-                            }
-                        }
-                } else {
-                    null
+                if (gateway.queryDisplayName(audioUri) != "$stem.$ext") {
+                    throw java.io.IOException("Provider created an unexpected audio name")
                 }
             }
 
-            if (!reuseOwned || gateway.documentLength(wavUri) != sourceWav.length()) {
-                writeDocument(gateway, wavUri) { out ->
-                    sourceWav.inputStream().use { input -> copyActively(input, out) }
+            if (!reuseOwned || gateway.documentLength(audioUri) != sourceAudio.length()) {
+                writeDocument(gateway, audioUri) { out ->
+                    sourceAudio.inputStream().use { input -> copyActively(input, out) }
                 }
-                val wavLength = gateway.documentLength(wavUri)
-                if (wavLength != sourceWav.length()) {
-                    throw java.io.IOException("Exported WAV length mismatch ($wavLength != ${sourceWav.length()})")
-                }
-            }
-            if (srtUri != null && srtContent != null) {
-                writeDocument(gateway, srtUri) { out ->
-                    out.write(srtContent.toByteArray(Charsets.UTF_8))
-                }
-                val srtLength = gateway.documentLength(srtUri)
-                val expectedSrt = srtContent.toByteArray(Charsets.UTF_8).size.toLong()
-                if (srtLength != expectedSrt) {
-                    throw java.io.IOException("Exported SRT length mismatch ($srtLength != $expectedSrt)")
+                val audioLength = gateway.documentLength(audioUri)
+                if (audioLength != sourceAudio.length()) {
+                    throw java.io.IOException("Exported audio length mismatch ($audioLength != ${sourceAudio.length()})")
                 }
             }
 
-            // Commit both pointers in one guarded, non-cancellable write.
-            // No SRT for this recording keeps any prior SRT pointer, else empty.
-            val committed = withContext(NonCancellable) {
-                commitUris(wavUri, srtUri ?: ownedSrt.orEmpty()).also { committedPair = it }
+            // Commit the audio pointer in one guarded, non-cancellable write.
+            val committedNow = withContext(NonCancellable) {
+                commitUri(audioUri).also { committed = it }
             }
-            if (!committed) {
+            if (!committedNow) {
                 // Session row vanished or changed: remove only what this
-                // attempt created; reused owned documents keep their content.
+                // attempt created; a reused owned document keeps its content.
                 created.forEach { gateway.deleteDocument(it) }
-                return TreeExportOutcome(null, null, null, null)
+                return ArtifactExportOutcome(null, null, null)
             }
 
             var cleanupError: String? = null
             if (!reuseOwned) {
-                val oldWav = ownedWav?.takeIf { it != wavUri }
-                val oldSrt = ownedSrt?.takeIf { srtUri == null || it != srtUri }
-                if (oldWav != null && !gateway.deleteDocument(oldWav)) {
-                    cleanupError = "$EXPORT_ERROR_PREFIX Previous export files could not be cleaned up."
-                }
-                if (oldSrt != null && !gateway.deleteDocument(oldSrt)) {
+                val oldAudio = ownedAudio?.takeIf { it != audioUri }
+                // Stage 2 replaces (and deletes) the superseded SRT after its
+                // own commit; audio cleanup never removes it.
+                if (oldAudio != null && !gateway.deleteDocument(oldAudio)) {
                     cleanupError = "$EXPORT_ERROR_PREFIX Previous export files could not be cleaned up."
                 }
             }
-            return TreeExportOutcome(wavUri, srtUri, null, cleanupError)
+            return ArtifactExportOutcome(audioUri, null, cleanupError)
         } catch (e: CancellationException) {
-            if (!committedPair) created.forEach { runCatching { gateway.deleteDocument(it) } }
+            if (!committed) created.forEach { runCatching { gateway.deleteDocument(it) } }
             throw e
         } catch (e: Exception) {
-            Log.e(TAG, "Tree export failed for $sessionId", e)
-            if (!committedPair) created.forEach { runCatching { gateway.deleteDocument(it) } }
-            return TreeExportOutcome(null, null, "$EXPORT_ERROR_PREFIX ${e.message ?: e.javaClass.simpleName}", null)
+            Log.e(TAG, "Audio tree export failed for $sessionId", e)
+            if (!committed) created.forEach { runCatching { gateway.deleteDocument(it) } }
+            return ArtifactExportOutcome(null, "$EXPORT_ERROR_PREFIX ${e.message ?: e.javaClass.simpleName}", null)
+        }
+    }
+
+    /**
+     * Stage 2 pure SAF export: writes the subtitle beside the committed
+     * audio document (`<audio display name>.srt`), reusing a matching owned
+     * SRT; a name taken by an unrelated file is never overwritten. Commits
+     * the SRT URI through the guarded [commitUri] before deleting any
+     * superseded owned subtitle.
+     */
+    internal suspend fun exportSrtToTree(
+        gateway: RecordingTreeGateway,
+        sessionId: String,
+        audioUri: String,
+        srtContent: String,
+        ownedSrtUri: String?,
+        commitUri: suspend (srtUri: String) -> Boolean,
+    ): ArtifactExportOutcome {
+        val audioName = gateway.queryDisplayName(audioUri)
+            ?: throw java.io.IOException("The exported audio file is no longer readable")
+        val desiredSrtName = audioName.substringBeforeLast('.') + ".srt"
+        val ownedSrt = ownedSrtUri?.takeIf { it.isNotBlank() }
+        val ownedSrtName = ownedSrt?.let { gateway.queryDisplayName(it) }
+        val reuse = ownedSrt != null && gateway.isInTree(ownedSrt) && ownedSrtName == desiredSrtName
+
+        val created = mutableListOf<String>()
+        var committed = false
+        try {
+            val srtUri: String
+            if (reuse) {
+                srtUri = ownedSrt!!
+            } else {
+                val names = gateway.childDocumentNames()
+                if (desiredSrtName in names) {
+                    // An unrelated file took the exact sidecar name between
+                    // stages: refuse the overwrite, audio stays unchanged.
+                    throw java.io.IOException("\"$desiredSrtName\" already exists in the recordings folder")
+                }
+                srtUri = gateway.createDocument(MIME_SRT, desiredSrtName)
+                    .also { created.add(it) }
+                if (gateway.queryDisplayName(srtUri) != desiredSrtName) {
+                    throw java.io.IOException("Provider created an unexpected SRT name")
+                }
+            }
+
+            writeDocument(gateway, srtUri) { out ->
+                out.write(srtContent.toByteArray(Charsets.UTF_8))
+            }
+            val srtLength = gateway.documentLength(srtUri)
+            val expectedSrt = srtContent.toByteArray(Charsets.UTF_8).size.toLong()
+            if (srtLength != expectedSrt) {
+                throw java.io.IOException("Exported SRT length mismatch ($srtLength != $expectedSrt)")
+            }
+
+            val committedNow = withContext(NonCancellable) {
+                commitUri(srtUri).also { committed = it }
+            }
+            if (!committedNow) {
+                created.forEach { gateway.deleteDocument(it) }
+                return ArtifactExportOutcome(null, null, null)
+            }
+
+            var cleanupError: String? = null
+            val oldSrt = ownedSrt?.takeIf { it != srtUri }
+            if (oldSrt != null && !gateway.deleteDocument(oldSrt)) {
+                cleanupError = "$EXPORT_ERROR_PREFIX Previous export files could not be cleaned up."
+            }
+            return ArtifactExportOutcome(srtUri, null, cleanupError)
+        } catch (e: CancellationException) {
+            if (!committed) created.forEach { runCatching { gateway.deleteDocument(it) } }
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "SRT tree export failed for $sessionId", e)
+            if (!committed) created.forEach { runCatching { gateway.deleteDocument(it) } }
+            return ArtifactExportOutcome(null, "$EXPORT_ERROR_PREFIX ${e.message ?: e.javaClass.simpleName}", null)
         }
     }
 

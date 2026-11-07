@@ -50,13 +50,59 @@ interface RecordingSessionDao {
     )
     suspend fun updateExportError(sessionId: String, message: String?): Int
 
-    /** Commits the paired SAF export pointers in one write, guarded by the
-     *  session still holding [expectedAudioPath] (and existing). */
+    /** Audio-stage success clears only its own failure; a prior subtitle
+     *  failure stays until the SRT stage succeeds. */
     @Query(
-        "UPDATE recording_sessions SET exportedWavUri = :wavUri, exportedSrtUri = :srtUri " +
+        "UPDATE recording_sessions SET errorMessage = NULL WHERE id = :sessionId " +
+            "AND (errorMessage IS NULL OR errorMessage LIKE 'Recording export failed: Audio:%')"
+    )
+    suspend fun clearAudioExportError(sessionId: String): Int
+
+    /** Two-stage finalization: audio is published while transcription runs
+     *  (phase recording → transcribing), then the final transcript lands
+     *  (phase transcribing → completed). Both are guarded phase transitions
+     *  that touch only their own columns. */
+    @Query(
+        "UPDATE recording_sessions SET phase = 'transcribing', endedAt = :endedAt, " +
+            "audioFileName = :audioFileName WHERE id = :sessionId AND phase = 'recording'"
+    )
+    suspend fun markRecordingStopped(sessionId: String, endedAt: Long, audioFileName: String?): Int
+
+    @Query(
+        "UPDATE recording_sessions SET phase = 'completed', transcriptID = :transcriptId " +
+            "WHERE id = :sessionId AND phase = 'transcribing'"
+    )
+    suspend fun completeRecording(sessionId: String, transcriptId: String): Int
+
+    /** Stage 1 commit: the exported audio pointer only, guarded by the row
+     *  still holding [expectedAudioPath]. */
+    @Query(
+        "UPDATE recording_sessions SET exportedWavUri = :audioUri " +
             "WHERE id = :sessionId AND audioFileName IS :expectedAudioPath"
     )
-    suspend fun updateRecordingExportUris(sessionId: String, expectedAudioPath: String?, wavUri: String, srtUri: String): Int
+    suspend fun updateExportedAudioUri(sessionId: String, expectedAudioPath: String?, audioUri: String): Int
+
+    /** Stage 2 commit: the exported SRT pointer only, additionally guarded by
+     *  the row still holding the committed Stage 1 audio URI. */
+    @Query(
+        "UPDATE recording_sessions SET exportedSrtUri = :srtUri " +
+            "WHERE id = :sessionId AND audioFileName IS :expectedAudioPath AND exportedWavUri IS :expectedAudioUri"
+    )
+    suspend fun updateExportedSrtUri(
+        sessionId: String,
+        expectedAudioPath: String?,
+        expectedAudioUri: String,
+        srtUri: String
+    ): Int
+
+    /** Terminal capture/codec failure: records the error while preserving any
+     *  already-saved audio path, export pointers, notes and a decoded
+     *  transcript (when one exists). */
+    @Query(
+        "UPDATE recording_sessions SET phase = 'failed', endedAt = :endedAt, errorMessage = :message, " +
+            "transcriptID = COALESCE(:transcriptId, transcriptID) WHERE id = :sessionId"
+    )
+    suspend fun failRecording(sessionId: String, endedAt: Long, message: String, transcriptId: String?): Int
 
     @Query("SELECT id, title FROM recording_sessions WHERE summaryState = 'generating'")
     suspend fun getSessionsWithGeneratingSummary(): List<SummaryGeneratingRow>
