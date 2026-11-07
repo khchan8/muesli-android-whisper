@@ -116,28 +116,50 @@ class Mp4SubtitleMuxerCuesTest {
     }
 
     @Test
-    fun `fingerprint ignores notes summary title and badge colors`() {
+    fun `fingerprint ignores notes title and badge colors`() {
         val base = listOf(segment(0, 1_000, "hello"))
-        val a = Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 100L, 200L, base)
+        val a = Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 100L, 200L, base, summary = "")
         // Same rendered content: everything the muxer does not render is invisible.
-        assertEquals(a, Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 100L, 200L, base))
+        assertEquals(a, Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 100L, 200L, base, summary = ""))
         val otherBadge = base.map { it.copy(badgeColorHex = "#FFFFFF", clusterId = 9) }
-        assertEquals(a, Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 100L, 200L, otherBadge))
+        assertEquals(a, Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 100L, 200L, otherBadge, summary = ""))
     }
 
     @Test
     fun `fingerprint changes with speaker text timing and audio identity`() {
         val base = listOf(segment(0, 1_000, "hello"))
-        val a = Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 100L, 200L, base)
+        val a = Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 100L, 200L, base, summary = "")
 
         assertNotEquals(a, Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 100L, 200L,
-            listOf(segment(0, 1_000, "hello", label = "Alice"))))
+            listOf(segment(0, 1_000, "hello", label = "Alice")), summary = ""))
         assertNotEquals(a, Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 100L, 200L,
-            listOf(segment(0, 1_000, "hello world"))))
+            listOf(segment(0, 1_000, "hello world")), summary = ""))
         assertNotEquals(a, Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 100L, 200L,
-            listOf(segment(0, 1_500, "hello"))))
-        assertNotEquals(a, Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 101L, 200L, base))
-        assertNotEquals(a, Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 100L, 201L, base))
-        assertNotEquals(a, Mp4SubtitleMuxer.mp4TranscriptFingerprint("s2", 100L, 200L, base))
+            listOf(segment(0, 1_500, "hello")), summary = ""))
+        assertNotEquals(a, Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 101L, 200L, base, summary = ""))
+        assertNotEquals(a, Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 100L, 201L, base, summary = ""))
+        assertNotEquals(a, Mp4SubtitleMuxer.mp4TranscriptFingerprint("s2", 100L, 200L, base, summary = ""))
+    }
+
+    @Test
+    fun `fingerprint changes when the summary changes`() {
+        val base = listOf(segment(0, 1_000, "hello"))
+        val noSummary = Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 100L, 200L, base, summary = "")
+        val withSummary = Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 100L, 200L, base, summary = "Summary")
+
+        assertNotEquals(noSummary, withSummary)
+        assertNotEquals(
+            withSummary,
+            Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 100L, 200L, base, summary = "Other summary"),
+        )
+    }
+
+    @Test
+    fun `whitespace-only summary fingerprints like no summary`() {
+        val base = listOf(segment(0, 1_000, "hello"))
+        assertEquals(
+            Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 100L, 200L, base, summary = ""),
+            Mp4SubtitleMuxer.mp4TranscriptFingerprint("s1", 100L, 200L, base, summary = "  \n\t "),
+        )
     }
 }

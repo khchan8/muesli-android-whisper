@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.Environment
 import android.provider.DocumentsContract
 import android.util.Log
+import com.phequals7.muesli.data.entity.RecordingSession
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -469,7 +470,7 @@ object MeetingStorageManager {
         val srtContent = MeetingTranscriptSrt.serialize(
             domainSegments,
             manualNotes = session.manualNotes,
-            summary = session.summaryText.takeUnless { it.startsWith("## Summary failed\n") }.orEmpty(),
+            summary = usableSummaryText(session),
             audioDurationMs = maxOf(durationMs, (session.endedAt ?: 0L) - (session.startedAt ?: 0L)),
         )
 
@@ -544,6 +545,7 @@ object MeetingStorageManager {
                         audioLength = sourceAudio.length(),
                         audioLastModifiedMs = sourceAudio.lastModified(),
                         segments = domainSegments,
+                        summary = usableSummaryText(latestSession),
                     )
                     val alreadyUpToDate = canSkipAutomaticMp4Export(
                         gateway = gateway,
@@ -906,6 +908,7 @@ object MeetingStorageManager {
         val audioLength: Long,
         val audioLastModifiedMs: Long,
         val fingerprint: String,
+        val summaryText: String,
         val desiredStem: String? = null,
     )
 
@@ -945,6 +948,10 @@ object MeetingStorageManager {
         if (gateway.queryDisplayName(ownedMp4Uri) != "$audioStem.mp4") return false
         return (gateway.documentSize(ownedMp4Uri) ?: -1L) > 0L
     }
+
+    /** Summary text rendered into artifacts; failed-summary notes are excluded. */
+    internal fun usableSummaryText(session: RecordingSession): String =
+        session.summaryText.takeUnless { it.startsWith("## Summary failed\n") }.orEmpty()
 
     /**
      * Opens the completed meeting's private M4A read-only under
@@ -999,8 +1006,10 @@ object MeetingStorageManager {
                     audioLength = audio.length(),
                     audioLastModifiedMs = audio.lastModified(),
                     fingerprint = Mp4SubtitleMuxer.mp4TranscriptFingerprint(
-                        sessionId, audio.length(), audio.lastModified(), domainSegments
+                        sessionId, audio.length(), audio.lastModified(), domainSegments,
+                        summary = usableSummaryText(session),
                     ),
+                    summaryText = usableSummaryText(session),
                     desiredStem = recordingBaseName(session.title, session.startedAt ?: session.createdAt),
                 )
             } catch (t: Throwable) {

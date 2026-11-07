@@ -40,7 +40,8 @@ import kotlin.math.roundToLong
  *    list) — never re-encoded.
  *  - Subtitle cues come only from transcript segments
  *    ([MeetingTranscriptSrt.normalizedSegments] + [MeetingTranscriptSrt.cueText]);
- *    notes and AI summaries stay in the standalone SRT.
+ *    notes stay in the standalone SRT, and the AI summary is drawn on the
+ *    canvas as cycling text pages (see [Mp4SummaryCanvas]).
  *  - Overlaps are resolved by a boundary sweep (ending cues close before
  *    starting cues open; simultaneous cues stack in stable order), gaps get
  *    empty samples so old subtitles clear, and a terminal blank stretches
@@ -56,7 +57,8 @@ object Mp4SubtitleMuxer {
     internal const val VIDEO_HEIGHT = 360
     private const val VIDEO_FPS = 1
     private const val VIDEO_BITRATE = 16_000
-    private const val I_FRAME_INTERVAL_S = 10
+    private const val VIDEO_BITRATE_SUMMARY = 192_000
+    private const val I_FRAME_INTERVAL_S = Mp4SummaryCanvas.PAGE_SECONDS
     private const val TIMEOUT_US = 10_000L
     private const val NO_PROGRESS_TIMEOUT_MS = 10_000L
     private const val MIME_AVC = MediaFormat.MIMETYPE_VIDEO_AVC
@@ -67,6 +69,8 @@ object Mp4SubtitleMuxer {
     /**
      * Muxes [m4aChannel] (a readable, nonempty, finalized AAC M4A with
      * exactly one audio track) plus [segments] into [outputMp4File].
+     * Non-blank [summaryText] is drawn on the canvas as cycling summary
+     * pages; blank keeps the plain dark slate.
      *
      * [outputMp4File] must not exist yet and lives in a caller-reserved
      * unique cache directory. Returns normally only after the written file
@@ -76,6 +80,7 @@ object Mp4SubtitleMuxer {
         m4aChannel: FileChannel,
         segments: List<DiarizedTranscriptSegment>,
         outputMp4File: File,
+        summaryText: String,
     ): Unit = withContext(Dispatchers.IO) {
         check(!outputMp4File.exists()) { "MP4 output already exists: ${outputMp4File.name}" }
         check(m4aChannel.size() > 0L) { "Source M4A is empty" }
@@ -112,8 +117,9 @@ object Mp4SubtitleMuxer {
             // 2. Subtitle timeline (transcript cues only; gaps blank; ends at audio end).
             val timeline = buildSubtitleCueTimeline(segments, audioDurationMs)
 
-            // 3. Encode the AVC canvas into the same cache directory.
-            encodeCanvasTrack(audioDurationMs, canvasFile)
+            // 3. Encode the AVC canvas (with summary pages when present).
+            val summaryPages = Mp4SummaryCanvas.Pages.create(summaryText)
+            encodeCanvasTrack(audioDurationMs, canvasFile, summaryPages)
             canvasSource = FileDataSourceImpl(canvasFile)
             val rawVideoTrack = MovieCreator.build(canvasSource!!)
                 .tracks.singleOrNull { it.handler == "vide" }
@@ -251,15 +257,18 @@ object Mp4SubtitleMuxer {
     /**
      * SHA-256 over a length-prefixed canonical form of the fingerprint
      * format version, session id, immutable private audio length/mtime, and
-     * the normalized `(startMs, endMs, cueText)` tuples. Title, notes,
-     * summary and non-rendered speaker metadata are deliberately excluded:
-     * editing them must not re-run video encoding.
+     * the normalized `(startMs, endMs, cueText)` tuples. Title, notes and
+     * non-rendered speaker metadata are deliberately excluded: editing them
+     * must not re-run video encoding. The AI summary is appended only when
+     * non-blank (it is drawn on the canvas), so summary-less meetings keep
+     * their existing fingerprint.
      */
     internal fun mp4TranscriptFingerprint(
         sessionId: String,
         audioLength: Long,
         audioLastModifiedMs: Long,
         segments: List<DiarizedTranscriptSegment>,
+        summary: String,
     ): String {
         fun java.io.DataOutputStream.lenUtf8(s: String) {
             val bytes = s.toByteArray(Charsets.UTF_8)
@@ -278,6 +287,10 @@ object Mp4SubtitleMuxer {
                     out.writeLong(cue.startMs)
                     out.writeLong(cue.endMs)
                     out.lenUtf8(MeetingTranscriptSrt.cueText(cue))
+                }
+                if (summary.isNotBlank()) {
+                    out.writeInt(2)
+                    out.lenUtf8(summary.trim())
                 }
             }
             buffer.toByteArray()
@@ -351,13 +364,13 @@ object Mp4SubtitleMuxer {
 
     // ── AVC canvas encoding ──────────────────────────────────────────────
 
-    private fun canvasFormat(): MediaFormat =
+    private fun canvasFormat(bitrate: Int): MediaFormat =
         MediaFormat.createVideoFormat(MIME_AVC, VIDEO_WIDTH, VIDEO_HEIGHT).apply {
             setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
             )
-            setInteger(MediaFormat.KEY_BIT_RATE, VIDEO_BITRATE)
+            setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, VIDEO_FPS)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL_S)
             setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
@@ -365,8 +378,7 @@ object Mp4SubtitleMuxer {
 
     /** Compatible AVC encoder names; hardware-accelerated first on API 29+,
      *  platform software fallback last (same pattern as the AAC encoder). */
-    private fun compatibleEncoderNames(): List<String> {
-        val format = canvasFormat()
+    private fun compatibleEncoderNames(format: MediaFormat): List<String> {
         val hardware = mutableListOf<String>()
         val other = mutableListOf<String>()
         for (info in MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos) {
@@ -387,13 +399,18 @@ object Mp4SubtitleMuxer {
     /** One dark-slate frame per whole second strictly before [durationMs]. */
     private fun expectedFrameCount(durationMs: Long): Int = ((durationMs + 999) / 1000).toInt()
 
-    private suspend fun encodeCanvasTrack(durationMs: Long, canvasFile: File) {
+    private suspend fun encodeCanvasTrack(
+        durationMs: Long,
+        canvasFile: File,
+        summaryPages: Mp4SummaryCanvas.Pages?,
+    ) {
         check(!canvasFile.exists() || canvasFile.delete()) { "Stale canvas file present" }
-        val format = canvasFormat()
+        val bitrate = if (summaryPages != null) VIDEO_BITRATE_SUMMARY else VIDEO_BITRATE
+        val format = canvasFormat(bitrate)
         var lastError: Throwable? = null
-        for (name in compatibleEncoderNames()) {
+        for (name in compatibleEncoderNames(format)) {
             try {
-                encodeCanvasWith(name, format, durationMs, canvasFile)
+                encodeCanvasWith(name, format, durationMs, canvasFile, summaryPages)
                 return
             } catch (e: CancellationException) {
                 throw e
@@ -414,6 +431,7 @@ object Mp4SubtitleMuxer {
         format: MediaFormat,
         durationMs: Long,
         canvasFile: File,
+        summaryPages: Mp4SummaryCanvas.Pages?,
     ) {
         val totalFrames = expectedFrameCount(durationMs).coerceAtLeast(1)
         val codec = MediaCodec.createByCodecName(encoderName)
@@ -478,7 +496,8 @@ object Mp4SubtitleMuxer {
                             ?: throw IllegalStateException("Encoder $encoderName exposes no input buffer")
                         val image = codec.getInputImage(inIndex)
                             ?: throw IllegalStateException("Encoder $encoderName exposes no writable input images")
-                        fillDarkSlate(image, rowBuffer)
+                        if (summaryPages == null) fillDarkSlate(image, rowBuffer)
+                        else writeYuv(image, summaryPages.yuv(summaryPages.pageForFrame(nextFrame)))
                         codec.queueInputBuffer(inIndex, 0, size, nextFrame * 1_000_000L, 0)
                         nextFrame++
                         lastProgressAt = SystemClock.elapsedRealtime()
@@ -562,6 +581,32 @@ object Mp4SubtitleMuxer {
                 val writeSpan = minOf(span, buffer.limit() - position)
                 buffer.position(position)
                 buffer.put(yRow, 0, writeSpan)
+            }
+        }
+    }
+
+    /** Writes a rendered YUV420 frame through each plane's real row/pixel
+     *  strides; absolute puts on each plane's own buffer keep NV12-style
+     *  interleaved U/V planes correct (U and V land on distinct bytes). */
+    private fun writeYuv(image: android.media.Image, yuv: Mp4SummaryCanvas.Yuv420) {
+        val crop = image.cropRect
+        val sources = arrayOf(yuv.y, yuv.u, yuv.v)
+        for ((planeIndex, plane) in image.planes.withIndex()) {
+            val src = sources[planeIndex]
+            val planeWidth = if (planeIndex == 0) crop.width() else (crop.width() + 1) / 2
+            val planeHeight = if (planeIndex == 0) crop.height() else (crop.height() + 1) / 2
+            val buffer = plane.buffer
+            val rowStride = plane.rowStride
+            val pixelStride = plane.pixelStride
+            val divisor = if (planeIndex == 0) 1 else 2
+            val base = (crop.top / divisor) * rowStride + (crop.left / divisor) * pixelStride
+            check(base + (planeHeight - 1) * rowStride + (planeWidth - 1) * pixelStride < buffer.limit()) {
+                "Encoder image plane does not contain the full crop"
+            }
+            for (row in 0 until planeHeight) {
+                for (col in 0 until planeWidth) {
+                    buffer.put(base + row * rowStride + col * pixelStride, src[row * planeWidth + col])
+                }
             }
         }
     }

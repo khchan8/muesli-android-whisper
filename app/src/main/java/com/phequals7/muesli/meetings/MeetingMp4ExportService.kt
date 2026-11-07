@@ -529,7 +529,9 @@ class MeetingMp4ExportService : Service() {
                 val output = File(cacheDir, "export.mp4")
                 snapshot.audioChannel.use { channel ->
                     channelClosed = true
-                    Mp4SubtitleMuxer.muxM4aAndSegmentsToMp4(channel, snapshot.segments, output)
+                    Mp4SubtitleMuxer.muxM4aAndSegmentsToMp4(
+                        channel, snapshot.segments, output, summaryText = snapshot.summaryText
+                    )
                 }
 
                 checkNotCancelled()

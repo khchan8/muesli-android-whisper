@@ -1,10 +1,12 @@
 package com.phequals7.muesli.meetings
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.media.MediaCodec
 import android.media.MediaCodecList
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
 import android.os.SystemClock
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -56,11 +58,15 @@ class Mp4SubtitleMuxerTest {
         encoder.stopAndRelease()
     }
 
-    private suspend fun mux(m4a: File, segments: List<DiarizedTranscriptSegment>): File {
+    private suspend fun mux(
+        m4a: File,
+        segments: List<DiarizedTranscriptSegment>,
+        summary: String = "",
+    ): File {
         val out = File(File(tempDir, "out-${System.nanoTime()}"), "export.mp4")
         out.parentFile!!.mkdirs()
         FileChannel.open(m4a.toPath(), StandardOpenOption.READ).use { channel ->
-            Mp4SubtitleMuxer.muxM4aAndSegmentsToMp4(channel, segments, out)
+            Mp4SubtitleMuxer.muxM4aAndSegmentsToMp4(channel, segments, out, summaryText = summary)
         }
         return out
     }
@@ -271,6 +277,65 @@ class Mp4SubtitleMuxerTest {
         )
     }
 
+    @Test
+    fun summaryPagesRenderOnCanvasAboveSubtitleArea() = runTest {
+        tempDir.mkdirs()
+        assumeTrue(hasAvcEncoder())
+        val m4a = File(tempDir, "summary.m4a")
+        encodeFixture(m4a, 11.0)
+        val summary = (1..40).joinToString("\n") { "- Decision $it: ship the build on Friday" }
+        val mp4 = mux(m4a, emptyList(), summary)
+
+        val retriever = MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(mp4.absolutePath)
+            val frame = retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+            assertTrue("decoder returned no frame", frame != null)
+            // Summary text occupies the top 232 px; the tx3g subtitle band stays dark.
+            assertTrue(
+                "expected bright summary pixels in the top region",
+                brightPixelCount(frame!!, 0, 0, 640, 232) > 200,
+            )
+            assertEquals("subtitle band must stay dark", 0, brightPixelCount(frame, 0, 248, 640, 360))
+            frame.recycle()
+        } finally {
+            retriever.release()
+        }
+    }
+
+    @Test
+    fun summaryCanvasPagesCycleAtTheTenSecondKeyFrame() = runTest {
+        tempDir.mkdirs()
+        assumeTrue(hasAvcEncoder())
+        val m4a = File(tempDir, "summary-cycle.m4a")
+        encodeFixture(m4a, 11.0)
+        val summary = (1..40).joinToString("\n") { "- Decision $it: ship the build on Friday" }
+        val mp4 = mux(m4a, emptyList(), summary)
+
+        val retriever = MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(mp4.absolutePath)
+            val first = retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)!!
+            val second = retriever.getFrameAtTime(10_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)!!
+            var changed = 0
+            for (y in 0 until 232) {
+                for (x in 0 until 640) {
+                    val a = first.getPixel(x, y)
+                    val b = second.getPixel(x, y)
+                    if (abs((a shr 16 and 0xFF) - (b shr 16 and 0xFF)) +
+                        abs((a shr 8 and 0xFF) - (b shr 8 and 0xFF)) +
+                        abs((a and 0xFF) - (b and 0xFF)) > 30
+                    ) changed++
+                }
+            }
+            first.recycle()
+            second.recycle()
+            assertTrue("expected a page change at 10 s, only $changed pixels differ", changed > 200)
+        } finally {
+            retriever.release()
+        }
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────
 
     private fun hasAvcEncoder(): Boolean {
@@ -283,6 +348,19 @@ class Mp4SubtitleMuxerTest {
                     info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).isFormatSupported(format)
                 }.getOrDefault(false)
         }
+    }
+
+    /** Pixels whose Rec.601 luma exceeds 128 inside [left, right) × [top, bottom). */
+    private fun brightPixelCount(frame: Bitmap, left: Int, top: Int, right: Int, bottom: Int): Int {
+        var count = 0
+        for (y in top until bottom) {
+            for (x in left until right) {
+                val p = frame.getPixel(x, y)
+                val luma = ((p shr 16 and 0xFF) * 299 + (p shr 8 and 0xFF) * 587 + (p and 0xFF) * 114) / 1000
+                if (luma > 128) count++
+            }
+        }
+        return count
     }
 
     /** Decodes the first AVC frame and proves a real dark-slate canvas (Y≈24). */
