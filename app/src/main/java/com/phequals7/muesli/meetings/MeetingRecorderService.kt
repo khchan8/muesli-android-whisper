@@ -47,6 +47,39 @@ import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
 
+/** A finished audio chunk ready for decode, with its position in the recording. */
+internal data class TimedChunk(val pcm: FloatArray, val startSec: Float, val endSec: Float)
+
+/**
+ * Splits [pcm] into windows of at most [maxWindowSeconds] with exact timestamps; a trailing
+ * remainder under 0.5 s is merged into the previous window. Segments under 0.5 s are dropped.
+ */
+internal fun splitTimedChunk(
+    pcm: FloatArray,
+    startSec: Float,
+    sampleRate: Int = 16000,
+    maxWindowSeconds: Int = 20
+): List<TimedChunk> {
+    val minSamples = sampleRate / 2
+    if (pcm.size < minSamples) return emptyList()
+    val maxSamples = sampleRate * maxWindowSeconds
+    val out = ArrayList<TimedChunk>()
+    var offset = 0
+    while (offset < pcm.size) {
+        var end = minOf(offset + maxSamples, pcm.size)
+        if (pcm.size - end < minSamples) end = pcm.size
+        out.add(
+            TimedChunk(
+                pcm.copyOfRange(offset, end),
+                startSec + offset.toFloat() / sampleRate,
+                startSec + end.toFloat() / sampleRate
+            )
+        )
+        offset = end
+    }
+    return out
+}
+
 /**
  * Foreground service that records a meeting and transcribes it on-device.
  *
@@ -81,14 +114,11 @@ class MeetingRecorderService : Service() {
         private const val CAPTURE_SAMPLE_RATE = 32000
         private const val MODEL_SAMPLE_RATE = 16000
         private const val CAPTURE_JOIN_TIMEOUT_MS = 5_000L
-        private const val CHUNK_SECONDS = 30 // fallback when VAD is unavailable
+        private const val CHUNK_SECONDS = 20 // fallback chunk length and max ASR window
         private const val PARTIAL_INTERVAL_MS = 5_000L
         private const val CHANNEL_ID = "meeting_recording"
         private const val NOTIFICATION_ID = 42
     }
-
-    /** A finished audio chunk ready for decode, with its position in the recording. */
-    private data class TimedChunk(val pcm: FloatArray, val startSec: Float, val endSec: Float)
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val decodeExecutor = Executors.newSingleThreadExecutor()
@@ -202,8 +232,8 @@ class MeetingRecorderService : Service() {
                         minSilenceDuration = 0.5f,
                         minSpeechDuration = 0.5f,
                         windowSize = 512,
-                        // iOS rotates VAD chunks at 3–60 s; 30 s caps decode latency per chunk.
-                        maxSpeechDuration = 30f,
+                        // Qwen3-ASR holds ≤ ~38 s per decode (512-token KV cache); VAD never force-cuts, so splitTimedChunk enforces it.
+                        maxSpeechDuration = CHUNK_SECONDS.toFloat(),
                     ),
                     sampleRate = MODEL_SAMPLE_RATE,
                     numThreads = 1,
@@ -821,8 +851,7 @@ class MeetingRecorderService : Service() {
             v.pop()
             if (segment.samples.size < MODEL_SAMPLE_RATE / 2) continue
             val startSec = segment.start.toFloat() / MODEL_SAMPLE_RATE
-            val endSec = startSec + segment.samples.size.toFloat() / MODEL_SAMPLE_RATE
-            finishedChunks.offer(TimedChunk(segment.samples, startSec, endSec))
+            for (sub in splitTimedChunk(segment.samples, startSec)) finishedChunks.offer(sub)
         }
         scheduleChunkDecode()
     }

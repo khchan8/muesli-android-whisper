@@ -230,6 +230,59 @@ object SherpaRecognizerHolder {
         block(primaryRecognizer!!, companionThaiRecognizer)
     }
 
+    internal const val QWEN3_MAX_WINDOW_SAMPLES = 16_000 * 20
+    internal const val MIN_TAIL_WINDOW_SAMPLES = 16_000 / 2
+
+    /**
+     * Re-slices [chunks] into contiguous windows of at most [maxWindowSamples]. A trailing
+     * remainder shorter than [minTailSamples] is merged into the previous window.
+     */
+    internal fun slicePcmIntoWindows(
+        chunks: List<FloatArray>,
+        maxWindowSamples: Int = QWEN3_MAX_WINDOW_SAMPLES,
+        minTailSamples: Int = MIN_TAIL_WINDOW_SAMPLES
+    ): List<FloatArray> {
+        val total = chunks.sumOf { it.size }
+        if (total <= 0) return emptyList()
+        if (chunks.size == 1 && total <= maxWindowSamples) return chunks
+        val all = FloatArray(total)
+        var pos = 0
+        for (c in chunks) { c.copyInto(all, pos); pos += c.size }
+        val windows = ArrayList<FloatArray>()
+        var offset = 0
+        while (offset < total) {
+            val end = minOf(offset + maxWindowSamples, total)
+            if (end - offset < minTailSamples && windows.isNotEmpty()) {
+                windows[windows.size - 1] = all.copyOfRange(offset - windows.last().size, total)
+            } else {
+                windows.add(all.copyOfRange(offset, end))
+            }
+            offset = end
+        }
+        return windows
+    }
+
+    private fun isCjkOrThai(c: Char) = c in '\u4E00'..'\u9FFF' || c in '\u0E00'..'\u0E7F'
+
+    internal fun joinDecodedWindows(left: String, right: String): String {
+        val l = left.trim()
+        val r = right.trim()
+        if (l.isEmpty()) return r
+        if (r.isEmpty()) return l
+        return if (isCjkOrThai(l.last()) && isCjkOrThai(r.first())) l + r else "$l $r"
+    }
+
+    private val qwen3ScaffoldOnly = Regex("^language(?:\\s+[a-z]{2,16})?$", RegexOption.IGNORE_CASE)
+
+    /** Drops Qwen3-ASR's `language <Lang><asr_text>` scaffold, including the overflow-truncated bare form. */
+    internal fun cleanQwen3ScaffoldText(rawText: String): String {
+        var t = rawText.trim()
+        val tag = "<asr_text>"
+        val i = t.indexOf(tag)
+        if (i >= 0) t = t.substring(i + tag.length).trim()
+        return if (qwen3ScaffoldOnly.matches(t)) "" else t
+    }
+
     /**
      * Decodes 16 kHz mono float chunks into text plus a detected language tag.
      * Routes explicit Thai audio to the Zipformer-Thai companion when the
@@ -260,25 +313,35 @@ object SherpaRecognizerHolder {
                 primary
             }
 
-            val stream = targetRecognizer.createStream()
-            try {
-                for (chunk in chunks) {
-                    stream.acceptWaveform(chunk, 16000)
+            val isQwen3 = modelType == MuesliAsrModelType.QWEN3_ASR_0_6B_INT8 ||
+                modelType == MuesliAsrModelType.QWEN3_ASR_1_7B_INT8
+            // Qwen3-ASR has a fixed 512-token KV cache shared by prompt + audio + output;
+            // longer audio is truncated and decodes to the bare "Language" scaffold.
+            val windows: List<List<FloatArray>> =
+                if (isQwen3) slicePcmIntoWindows(chunks).map { listOf(it) } else listOf(chunks)
+            var text = ""
+            var lang = ""
+            var emotion: String? = null
+            for (window in windows) {
+                val stream = targetRecognizer.createStream()
+                try {
+                    for (chunk in window) stream.acceptWaveform(chunk, 16000)
+                    targetRecognizer.decode(stream)
+                    val raw = targetRecognizer.getResult(stream)
+                    val piece = if (isQwen3) cleanQwen3ScaffoldText(raw.text) else raw.text.trim()
+                    text = joinDecodedWindows(text, piece)
+                    if (lang.isEmpty()) lang = raw.lang.trim().removePrefix("<|").removeSuffix("|>")
+                    if (emotion == null) emotion = raw.emotion.takeIf { it.isNotBlank() }
+                } finally {
+                    stream.release()
                 }
-                targetRecognizer.decode(stream)
-                val raw = targetRecognizer.getResult(stream)
-                val detectedLang = raw.lang.trim()
-                    .removePrefix("<|").removeSuffix("|>")
-                    .ifEmpty { if (targetRecognizer === thaiCompanion) "th" else languageHint }
-                TranscriptionResult(
-                    text = raw.text.trim(),
-                    languageCode = detectedLang,
-                    emotionTag = raw.emotion.takeIf { it.isNotBlank() },
-                    durationMs = durationMs
-                )
-            } finally {
-                stream.release()
             }
+            TranscriptionResult(
+                text = text,
+                languageCode = lang.ifEmpty { if (targetRecognizer === thaiCompanion) "th" else languageHint },
+                emotionTag = emotion,
+                durationMs = durationMs
+            )
         }
     }
 
@@ -633,7 +696,16 @@ class SherpaOnnxEngine(private val context: Context) : TranscriptionEngine {
     /** Re-decodes the audio captured so far to emulate a live partial result. */
     private fun schedulePartial() {
         if (!partialBusy.compareAndSet(false, true)) return
-        val snapshot = synchronized(lock) { chunks.toList() }
+        val snapshot = synchronized(lock) {
+            // Preview only needs the most recent window; decode() still handles full audio at stop.
+            val tail = ArrayDeque<FloatArray>()
+            var n = 0
+            for (c in chunks.asReversed()) {
+                if (n >= SherpaRecognizerHolder.QWEN3_MAX_WINDOW_SAMPLES) break
+                tail.addFirst(c); n += c.size
+            }
+            tail.toList()
+        }
         if (snapshot.sumOf { it.size } < SAMPLE_RATE) {
             partialBusy.set(false)
             return
