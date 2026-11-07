@@ -567,9 +567,28 @@ class SpeakerDiarizer(
         }
     }
 
-    // (Removed) enrollOrUpdateSpeakerProfile: post-meeting cluster enrollment
-    // was removed with the detail-screen speaker sheet. Direct-microphone
-    // enrollment lives in SpeakerProfilesScreen via enrollSpeakerFromAudioSamples.
+    /**
+     * Saves (or extends) a profile from a meeting speaker's stored CAM++ cluster
+     * centroid, so no audio is re-processed. Fails like [persistEnrollment] on
+     * invalid vectors or a mismatched model family.
+     */
+    suspend fun enrollSpeakerFromCentroid(
+        sessionId: String,
+        clusterCentroid: FloatArray,
+        displayName: String,
+        existingProfileId: String?,
+        badgeColorHex: String?,
+        durationMs: Long
+    ): SpeakerProfileRecord = withContext(Dispatchers.IO) {
+        persistEnrollment(
+            normalizedSample = SpeakerEmbeddingSerializer.l2Normalize(clusterCentroid),
+            displayName = displayName,
+            existingProfileId = existingProfileId,
+            badgeColorHex = badgeColorHex,
+            sourceSessionId = sessionId,
+            durationMs = durationMs
+        )
+    }
 
     /**
      * Validates the new embedding and persists the profile (running

@@ -29,6 +29,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.phequals7.muesli.audio.AudioInputRouteManager
 import com.phequals7.muesli.data.SharedStore
+import com.phequals7.muesli.data.AppBackup
 import com.phequals7.muesli.data.entity.CustomWord
 import com.phequals7.muesli.meetings.MeetingTemplate
 import com.phequals7.muesli.meetings.RecordingExportAccess
@@ -354,6 +355,14 @@ private fun MeetingsSettings(store: SharedStore) {
     val folderLabel = remember(folderRevision, store.recordingsTreeUri) {
         RecordingExportAccess.describeFolder(context, store.recordingsTreeUri)
     }
+    val scope = rememberCoroutineScope()
+    var autoBackup by remember { mutableStateOf(store.autoBackupEnabled) }
+    var backupBusy by remember { mutableStateOf(false) }
+    var confirmRestore by remember { mutableStateOf(false) }
+    var backupStatus by remember { mutableStateOf<Pair<String, Boolean>?>(null) }
+    val treeUri = remember(folderRevision, store.recordingsTreeUri) {
+        store.recordingsTreeUri.takeIf { it.isNotBlank() }?.let(Uri::parse)
+    }
 
     Column(verticalArrangement = Arrangement.spacedBy(MuesliSpacing.s16)) {
         SettingsCard {
@@ -412,6 +421,74 @@ private fun MeetingsSettings(store: SharedStore) {
                 Text(if (folderLabel != null) "Change folder" else "Choose recordings folder", fontSize = 12.sp)
             }
         }
+
+        SettingsCard {
+            Text("Backup & restore", color = colors.textPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+            ToggleRow(
+                title = "Automatic backup",
+                subtitle = "Saves ${AppBackup.FILE_NAME} in the Recordings folder when you leave the app: settings, custom words and voice profiles (not API keys or sign-ins). Other apps with access to that folder can read it.",
+                checked = autoBackup,
+                onCheckedChange = { autoBackup = it; store.autoBackupEnabled = it }
+            )
+            Text(
+                if (treeUri == null) "Choose a recordings folder first." else "After reinstalling, choose the same folder and tap Restore.",
+                color = colors.textSecondary, fontSize = 11.sp, lineHeight = 15.sp
+            )
+            backupStatus?.let {
+                Text(it.first, color = if (it.second) colors.textSecondary else colors.destructive, fontSize = 11.sp, lineHeight = 15.sp)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(MuesliSpacing.s8)) {
+                Button(
+                    enabled = treeUri != null && !backupBusy,
+                    onClick = {
+                        backupBusy = true
+                        scope.launch {
+                            val r = AppBackup.backup(context, treeUri!!, force = true)
+                            backupStatus = (r.getOrNull() ?: r.exceptionOrNull()?.message ?: "Backup failed") to r.isSuccess
+                            backupBusy = false
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = colors.accent),
+                    shape = RoundedCornerShape(MuesliCorners.medium),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                ) { Text("Back up now", fontSize = 12.sp) }
+                Button(
+                    enabled = treeUri != null && !backupBusy,
+                    onClick = { confirmRestore = true },
+                    colors = ButtonDefaults.buttonColors(containerColor = colors.accent),
+                    shape = RoundedCornerShape(MuesliCorners.medium),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                ) { Text("Restore", fontSize = 12.sp) }
+            }
+        }
+    }
+
+    if (confirmRestore) {
+        AlertDialog(
+            onDismissRequest = { confirmRestore = false },
+            containerColor = colors.backgroundRaised,
+            title = { Text("Restore from backup?", color = colors.textPrimary) },
+            text = {
+                Text(
+                    "Overwrites matching settings and adds or updates custom words and voice profiles from ${AppBackup.FILE_NAME}. Nothing already on this device is deleted.",
+                    color = colors.textSecondary
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmRestore = false
+                    backupBusy = true
+                    scope.launch {
+                        val r = AppBackup.restore(context, treeUri!!)
+                        backupStatus = (r.getOrNull() ?: r.exceptionOrNull()?.message ?: "Restore failed") to r.isSuccess
+                        backupBusy = false
+                    }
+                }) { Text("Restore", color = colors.accent) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmRestore = false }) { Text("Cancel", color = colors.textSecondary) }
+            }
+        )
     }
 }
 

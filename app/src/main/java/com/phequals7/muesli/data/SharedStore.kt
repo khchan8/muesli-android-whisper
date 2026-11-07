@@ -50,6 +50,9 @@ class SharedStore(private val context: Context) {
         private const val KEY_RECORDINGS_TREE_URI = "recordings_tree_uri"
         private const val KEY_LANGUAGE_HINT = "language_hint" // "auto", "en", "th", "zh", "yue"
         private const val KEY_EXPORT_EMBEDDED_MP4 = "export_embedded_mp4_enabled"
+        private const val KEY_BACKUP_AUTO = "backup_auto_enabled"
+        private const val KEY_BACKUP_LAST_AT = "backup_last_at"
+        private const val KEY_BACKUP_LAST_HASH = "backup_last_hash"
 
         /**
          * Pure snapshot-validation predicate shared by pre-publish validation
@@ -178,6 +181,36 @@ class SharedStore(private val context: Context) {
         get() = prefs.getString(KEY_RECORDINGS_TREE_URI, "") ?: ""
         set(value) = prefs.edit().putString(KEY_RECORDINGS_TREE_URI, value).apply()
 
+    /** Write `muesli-backup.json` into the Recordings folder when the app is left. */
+    var autoBackupEnabled: Boolean
+        get() = prefs.getBoolean(KEY_BACKUP_AUTO, true)
+        set(value) = prefs.edit().putBoolean(KEY_BACKUP_AUTO, value).apply()
+
+    /** `exportedAt` of the backup this install last wrote or restored (0 = never). */
+    var lastBackupAtMs: Long
+        get() = prefs.getLong(KEY_BACKUP_LAST_AT, 0L)
+        set(value) = prefs.edit().putLong(KEY_BACKUP_LAST_AT, value).apply()
+
+    var lastBackupHash: String
+        get() = prefs.getString(KEY_BACKUP_LAST_HASH, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_BACKUP_LAST_HASH, value).apply()
+
+    /** Raw snapshot of every stored preference (AppBackup filters out secrets). */
+    fun allPrefs(): Map<String, Any?> = prefs.all
+
+    /** Writes already-filtered backup values; unsupported value types are skipped. */
+    fun applyPrefs(values: Map<String, Any>) {
+        val e = prefs.edit()
+        for ((k, v) in values) when (v) {
+            is Boolean -> e.putBoolean(k, v)
+            is String -> e.putString(k, v)
+            is Int -> e.putInt(k, v)
+            is Long -> e.putLong(k, v)
+            is Float -> e.putFloat(k, v)
+        }
+        e.apply()
+    }
+
     /** Also export a same-basename `.mp4` (canvas video + copied audio +
      *  embedded tx3g transcript subtitles) after the SRT stage; default off. */
     var exportEmbeddedMp4Enabled: Boolean
@@ -271,6 +304,18 @@ class SharedStore(private val context: Context) {
 
     suspend fun replaceTranscriptSegments(sessionId: String, segments: List<MeetingTranscriptSegmentEntity>, inlineText: String) =
         transcriptSegmentDao.replaceSegmentsForSession(sessionId, segments, inlineText)
+
+    /** Relabels one speaker's turns and refreshes the flat transcript text to match. */
+    suspend fun relabelSpeakerCluster(sessionId: String, clusterId: Int, profileId: String, label: String, badgeColorHex: String) {
+        transcriptSegmentDao.updateClusterSpeakerAttribution(sessionId, clusterId, profileId, label, badgeColorHex)
+        val segments = transcriptSegmentDao.getSegmentsForSession(sessionId)
+        if (segments.isNotEmpty()) {
+            transcriptSegmentDao.updateInlineTranscriptText(
+                sessionId,
+                com.phequals7.muesli.meetings.SpeakerDiarizer(null).formatInlineTranscript(segments.map { it.toDomainModel() })
+            )
+        }
+    }
 
     suspend fun markRecordingStopped(sessionId: String, endedAt: Long, audioFileName: String?): Int =
         recordingSessionDao.markRecordingStopped(sessionId, endedAt, audioFileName)

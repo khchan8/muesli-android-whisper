@@ -307,6 +307,24 @@ fun MeetingDetailScreen(
         onCancelMp4Export = {
             com.phequals7.muesli.meetings.MeetingMp4ExportService.cancel(context, meeting.id)
         },
+        onSaveSpeaker = { speaker, name, profileId, color ->
+            kotlinx.coroutines.withContext(Dispatchers.IO) {
+                runCatching {
+                    val app = context.applicationContext
+                    val saved = com.phequals7.muesli.meetings.SpeakerDiarizer(
+                        app, com.phequals7.muesli.data.AppDatabase.getSpeakerProfileStore(app)
+                    ).enrollSpeakerFromCentroid(
+                        sessionId = meeting.id,
+                        clusterCentroid = speaker.centroid,
+                        displayName = name,
+                        existingProfileId = profileId,
+                        badgeColorHex = color.ifBlank { null },
+                        durationMs = speaker.speakingMs
+                    )
+                    store.relabelSpeakerCluster(meeting.id, speaker.clusterId, saved.profileId, saved.displayName, saved.badgeColorHex)
+                }.fold(onSuccess = { null }, onFailure = { it.message ?: "Could not save the voice profile" })
+            }
+        },
         onChooseFolder = { chooseFolder() },
         onShareTranscript = { formatted ->
             val body = buildString {
@@ -371,6 +389,7 @@ private fun MeetingDetailContent(
     onCancelMp4Export: () -> Unit,
     onShareTranscript: (String) -> Unit,
     onDelete: () -> Unit,
+    onSaveSpeaker: suspend (MeetingSpeaker, String, String?, String) -> String?,
     onNavigateBack: () -> Unit
 ) {
     val lazyListState = rememberLazyListState()
@@ -393,6 +412,8 @@ private fun MeetingDetailContent(
 
     // Tabs: 0 = Transcript, 1 = Summary
     var selectedTabIndex by remember { mutableIntStateOf(0) }
+    var speakerSheetOpen by remember { mutableStateOf(false) }
+    val speakers = remember(segments) { meetingSpeakers(segments) }
 
     // Same normalization as the on-disk SRT: on-screen cues and sidecars cannot diverge.
     val cues = remember(segments) { MeetingTranscriptSrt.normalizedSegments(segments) }
@@ -536,6 +557,11 @@ private fun MeetingDetailContent(
                     }
                     DropdownMenu(expanded = mp4MenuOpen, onDismissRequest = { mp4MenuOpen = false }) {
                         DropdownMenuItem(
+                            text = { Text("Name speakers") },
+                            onClick = { mp4MenuOpen = false; speakerSheetOpen = true },
+                            enabled = speakers.any { it.centroid.isNotEmpty() }
+                        )
+                        DropdownMenuItem(
                             text = { Text(if (hasExportedMp4) "Regenerate MP4" else "Export MP4") },
                             onClick = { mp4MenuOpen = false; onExportMp4() },
                             enabled = mp4Eligible && !mp4Busy
@@ -547,6 +573,13 @@ private fun MeetingDetailContent(
                                 enabled = false
                             )
                         }
+                    }
+                    if (speakerSheetOpen) {
+                        SpeakerNamingSheet(
+                            speakers = speakers,
+                            onSave = onSaveSpeaker,
+                            onDismiss = { speakerSheetOpen = false }
+                        )
                     }
                     TextButton(onClick = onDelete) {
                         Text("Delete", color = MaterialTheme.colorScheme.error)
@@ -1022,7 +1055,7 @@ private fun formatDurationMs(ms: Long): String {
     }
 }
 
-private fun parseHexColor(hex: String): Color {
+internal fun parseHexColor(hex: String): Color {
     return try {
         Color(android.graphics.Color.parseColor(hex))
     } catch (_: Exception) {

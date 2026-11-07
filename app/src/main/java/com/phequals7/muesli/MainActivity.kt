@@ -25,6 +25,12 @@ import com.phequals7.muesli.model.SpeechModels
 import com.phequals7.muesli.theme.AppearanceController
 import com.phequals7.muesli.theme.MuesliTheme
 import com.phequals7.muesli.ui.launch.LaunchWarmupScreen
+import android.net.Uri
+import com.phequals7.muesli.data.AppBackup
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
@@ -94,6 +100,19 @@ class MainActivity : ComponentActivity() {
           }
         }
       }
+    }
+  }
+
+  override fun onStop() {
+    super.onStop()
+    val store = SharedStore(this)
+    val tree = store.recordingsTreeUri
+    if (tree.isBlank() || !store.autoBackupEnabled) return
+    val appContext = applicationContext
+    // Not tied to the activity: the write must finish after it is stopped.
+    CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+      AppBackup.backup(appContext, Uri.parse(tree), force = false)
+        .onFailure { android.util.Log.w("MainActivity", "Auto backup failed", it) }
     }
   }
 }
