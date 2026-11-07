@@ -359,4 +359,111 @@ class MigrationTest {
 
         db.close()
     }
+
+    /** v5 tables + v6 export pointers + v7 originalTitle, at version 7. */
+    private fun createV7Database() {
+        createV5Database()
+        SQLiteDatabase.openOrCreateDatabase(context.getDatabasePath(dbName), null).use { db ->
+            db.execSQL("ALTER TABLE recording_sessions ADD COLUMN exportedWavUri TEXT")
+            db.execSQL("ALTER TABLE recording_sessions ADD COLUMN exportedSrtUri TEXT")
+            db.execSQL("ALTER TABLE recording_sessions ADD COLUMN originalTitle TEXT")
+            db.execSQL(
+                "UPDATE recording_sessions SET exportedWavUri = 'tree://v7audio', exportedSrtUri = 'tree://v7srt', " +
+                    "originalTitle = 'v7 original' WHERE id = 'v5s'"
+            )
+            db.version = 7
+        }
+    }
+
+    @Test
+    fun migrate7To8_addsMp4ColumnsAndKeepsPriorData() {
+        createV7Database()
+
+        val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
+            .addMigrations(*AppDatabase.MIGRATIONS)
+            .build()
+
+        runBlocking {
+            val session = db.recordingSessionDao().getSessionById("v5s")
+            assertNotNull(session)
+            assertEquals("v5 title", session!!.title) // row built by the v5 fixture
+            assertEquals("kept notes", session.manualNotes)
+            assertEquals("tree://v7audio", session.exportedAudioUri)
+            assertEquals("tree://v7srt", session.exportedSrtUri)
+            assertEquals("v7 original", session.originalTitle)
+            assertNull("MIGRATION_7_8 leaves MP4 pointers null", session.exportedMp4Uri)
+            assertNull(session.mp4TranscriptFingerprint)
+            assertNull(session.mp4ExportError)
+        }
+
+        db.close()
+    }
+
+    @Test
+    fun mp4CommitsAreGuardedAndIndependentOfAudioSrtSummaryErrors() {
+        createV7Database()
+
+        val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
+            .addMigrations(*AppDatabase.MIGRATIONS)
+            .build()
+
+        runBlocking {
+            val dao = db.recordingSessionDao()
+            val commit: suspend (String) -> Int = { uri ->
+                dao.updateExportedMp4Uri(
+                    sessionId = "v5s",
+                    expectedAudioPath = "Meeting_2026.wav",
+                    expectedAudioUri = "tree://v7audio",
+                    expectedSrtUri = "tree://v7srt",
+                    expectedTitle = "v5 title",
+                    expectedOldMp4Uri = null,
+                    mp4Uri = uri,
+                    fingerprint = "fp1"
+                )
+            }
+
+            // Every guard rejects a changed field.
+            assertEquals(0, dao.updateExportedMp4Uri("v5s", "stale.wav", "tree://v7audio", "tree://v7srt", "v5 title", null, "tree://mp4", "f"))
+            assertEquals(0, dao.updateExportedMp4Uri("v5s", "Meeting_2026.wav", "tree://wrong", "tree://v7srt", "v5 title", null, "tree://mp4", "f"))
+            assertEquals(0, dao.updateExportedMp4Uri("v5s", "Meeting_2026.wav", "tree://v7audio", null, "v5 title", null, "tree://mp4", "f"))
+            assertEquals(0, dao.updateExportedMp4Uri("v5s", "Meeting_2026.wav", "tree://v7audio", "tree://v7srt", "renamed title", null, "tree://mp4", "f"))
+            assertEquals(0, dao.updateExportedMp4Uri("v5s", "Meeting_2026.wav", "tree://v7audio", "tree://v7srt", "v5 title", "tree://other", "tree://mp4", "f"))
+            assertNull(dao.getSessionById("v5s")?.exportedMp4Uri)
+
+            // Wrong phase also rejects.
+            db.openHelper.writableDatabase.execSQL("UPDATE recording_sessions SET phase = 'failed' WHERE id = 'v5s'")
+            assertEquals(0, commit("tree://mp4"))
+            db.openHelper.writableDatabase.execSQL("UPDATE recording_sessions SET phase = 'completed' WHERE id = 'v5s'")
+
+            // The correct guard commits pointer + fingerprint and clears the error.
+            dao.updateMp4ExportError("v5s", "earlier failure")
+            assertEquals(1, commit("tree://mp4"))
+            val session = dao.getSessionById("v5s")!!
+            assertEquals("tree://mp4", session.exportedMp4Uri)
+            assertEquals("fp1", session.mp4TranscriptFingerprint)
+            assertNull(session.mp4ExportError)
+
+            // MP4 errors never touch phase, summary state or the shared error column.
+            assertEquals(1, dao.updateMp4ExportError("v5s", "codec failed"))
+            val errored = dao.getSessionById("v5s")!!
+            assertEquals("codec failed", errored.mp4ExportError)
+            assertEquals("completed", errored.phase)
+            assertNull(errored.errorMessage)
+            assertEquals("completed", errored.summaryState)
+            assertEquals("tree://mp4", errored.exportedMp4Uri)
+
+            // An audio/SRT export failure and an MP4 failure coexist.
+            assertEquals(1, dao.updateExportError("v5s", "Recording export failed: SRT: boom"))
+            assertEquals(1, dao.updateMp4ExportError("v5s", "still failing"))
+            val both = dao.getSessionById("v5s")!!
+            assertEquals("Recording export failed: SRT: boom", both.errorMessage)
+            assertEquals("still failing", both.mp4ExportError)
+
+            // A rejected row (deleted session) never recreates anything.
+            assertEquals(0, dao.updateMp4ExportError("missing", "x"))
+            assertEquals(0, dao.updateExportedMp4Uri("missing", null, "a", null, "t", null, "u", "f"))
+        }
+
+        db.close()
+    }
 }

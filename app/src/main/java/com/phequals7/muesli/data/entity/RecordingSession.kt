@@ -36,5 +36,11 @@ data class RecordingSession(
     /** SAF document URI of the exported SRT beside the audio (Room v6). */
     val exportedSrtUri: String? = null,
     /** Original title before the first AI-generated title, if one was added. */
-    val originalTitle: String? = null
+    val originalTitle: String? = null,
+    /** SAF document URI of the exported MP4 (transcript-subtitle mux) beside the audio (Room v8). */
+    val exportedMp4Uri: String? = null,
+    /** Transcript fingerprint of the content embedded in [exportedMp4Uri] (Room v8). */
+    val mp4TranscriptFingerprint: String? = null,
+    /** MP4-export-only failure text; never reflects audio/SRT export health (Room v8). */
+    val mp4ExportError: String? = null
 )

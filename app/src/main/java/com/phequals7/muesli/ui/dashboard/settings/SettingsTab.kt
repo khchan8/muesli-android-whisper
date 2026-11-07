@@ -346,6 +346,7 @@ private fun MeetingsSettings(store: SharedStore) {
     val colors = MuesliTheme.colors
     var defaultTemplate by remember { mutableStateOf(MeetingTemplate.fromId(store.defaultMeetingTemplate)) }
     var retainAudio by remember { mutableStateOf(store.retainMeetingAudio) }
+    var exportMp4 by remember { mutableStateOf(store.exportEmbeddedMp4Enabled) }
     var speakerLabels by remember { mutableStateOf(store.speakerLabelsEnabled) }
     var folderError by remember { mutableStateOf<String?>(null) }
     var folderRevision by remember { mutableIntStateOf(0) }
@@ -383,6 +384,12 @@ private fun MeetingsSettings(store: SharedStore) {
                 subtitle = "Keeps the M4A audio file on device for future playback and speaker separation.",
                 checked = retainAudio,
                 onCheckedChange = { retainAudio = it; store.retainMeetingAudio = it }
+            )
+            ToggleRow(
+                title = "Also export MP4 with embedded subtitles",
+                subtitle = "After the SRT is saved, writes a matching .mp4 (dark video canvas + the audio + switchable subtitle track) next to it. Everything is processed on this device; notes and AI summaries stay in the .srt.",
+                checked = exportMp4,
+                onCheckedChange = { exportMp4 = it; store.exportEmbeddedMp4Enabled = it }
             )
 
             Text("Recordings folder", color = colors.textPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)

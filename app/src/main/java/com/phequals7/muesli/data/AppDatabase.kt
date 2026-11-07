@@ -30,7 +30,7 @@ import com.phequals7.muesli.data.entity.Transcript
         SpeakerProfileEntity::class,
         SpeakerProfileSampleEntity::class
     ],
-    version = 7,
+    version = 8,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -146,8 +146,18 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /** Room v7 → v8: nullable MP4 export pointer, transcript fingerprint,
+         *  and MP4-only error for the embedded-subtitle export (Room v8). */
+        private val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE recording_sessions ADD COLUMN exportedMp4Uri TEXT")
+                db.execSQL("ALTER TABLE recording_sessions ADD COLUMN mp4TranscriptFingerprint TEXT")
+                db.execSQL("ALTER TABLE recording_sessions ADD COLUMN mp4ExportError TEXT")
+            }
+        }
+
         /** Exposed for migration tests. */
-        internal val MIGRATIONS = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
+        internal val MIGRATIONS = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
 
         fun getDatabase(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {

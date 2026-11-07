@@ -128,4 +128,7 @@ dependencies {
 
   // tar.bz2 extraction for models distributed as archives (Parakeet 110M)
   implementation(libs.commons.compress)
+
+  // MP4 muxing for embedded tx3g subtitle exports (v2.3); pinned pure-Java ISO muxer.
+  implementation("com.googlecode.mp4parser:isoparser:1.1.22")
 }

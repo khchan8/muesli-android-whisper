@@ -36,6 +36,10 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
         <service
+            android:name=".meetings.MeetingMp4ExportService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+        <service
             android:name=".ime.MuesliInputMethodService"
             android:label="@string/keyboard_name"
             android:permission="android.permission.BIND_INPUT_METHOD"

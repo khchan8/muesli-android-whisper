@@ -31,7 +31,10 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -130,13 +133,31 @@ fun MeetingDetailScreen(
 ) {
     val context = LocalContext.current
 
-    val segmentEntities by store.getTranscriptSegmentsFlow(meeting.id)
-        .collectAsState(initial = emptyList<MeetingTranscriptSegmentEntity>())
+    val segmentsFlow = remember(store, meeting.id) {
+        store.getTranscriptSegmentsFlow(meeting.id)
+    }
+    val loadedSegmentEntities by segmentsFlow.collectAsState(initial = null)
+    val segmentEntities = loadedSegmentEntities.orEmpty()
     val segments = remember(segmentEntities) { segmentEntities.map { it.toDomainModel() } }
-    val transcriptRow by store.getTranscriptForSessionFlow(meeting.id)
-        .collectAsState(initial = null)
+    val segmentProjection = remember(loadedSegmentEntities) {
+        loadedSegmentEntities?.map {
+            com.phequals7.muesli.data.dao.Mp4SegmentProjection(
+                orderIndex = it.orderIndex,
+                startMs = it.startMs,
+                endMs = it.endMs,
+                speakerLabel = it.speakerLabel,
+                text = it.text,
+            )
+        }
+    }
+    val transcriptFlow = remember(store, meeting.id) {
+        store.getTranscriptForSessionFlow(meeting.id)
+    }
+    val transcriptRow by transcriptFlow.collectAsState(initial = null)
     var notes by remember { mutableStateOf(meeting.manualNotes) }
     val summaryProgress by com.phequals7.muesli.meetings.MeetingSummaryService.progress.collectAsState()
+    val mp4ProgressAll by com.phequals7.muesli.meetings.MeetingMp4ExportService.progress.collectAsState()
+    val mp4QueuedIds by com.phequals7.muesli.meetings.MeetingMp4ExportService.queuedSessionIds.collectAsState()
     val scope = rememberCoroutineScope()
     var folderError by remember { mutableStateOf<String?>(null) }
     val chooseFolder = com.phequals7.muesli.meetings.rememberRecordingsFolderPicker(
@@ -188,8 +209,19 @@ fun MeetingDetailScreen(
     // Completed-session subtitle refresh keyed to persisted segment entities
     // and summary text too (speaker labels / AI summary live in the SRT), not
     // just note edits. Stage 2 never touches the committed audio.
-    LaunchedEffect(meeting.id, meeting.phase, meeting.summaryText, segmentEntities) {
-        if (meeting.phase != "completed") return@LaunchedEffect
+    val enteredCompleted = remember(meeting.id) { meeting.phase == "completed" }
+    var lastSyncedSubtitleKey by remember(meeting.id) { mutableStateOf<Any?>(null) }
+    LaunchedEffect(meeting.id, meeting.phase, meeting.summaryText, segmentProjection) {
+        if (meeting.phase != "completed" || segmentProjection == null) return@LaunchedEffect
+        val key = Triple(meeting.phase, meeting.summaryText, segmentProjection)
+        if (lastSyncedSubtitleKey == null && enteredCompleted) {
+            // Initial entry for an already-completed meeting is covered by
+            // syncRecordingArtifacts above; only subsequent changes re-export.
+            lastSyncedSubtitleKey = key
+            return@LaunchedEffect
+        }
+        if (lastSyncedSubtitleKey == key) return@LaunchedEffect
+        lastSyncedSubtitleKey = key
         launch(Dispatchers.IO) {
             runCatching { MeetingStorageManager.exportSrtArtifactOnly(context.applicationContext, store, meeting.id) }
         }
@@ -227,6 +259,19 @@ fun MeetingDetailScreen(
         aiSummary = meeting.summaryText.takeIf { it.isNotBlank() },
         summaryState = meeting.summaryState,
         summaryProgress = summaryProgress,
+        mp4Progress = mp4ProgressAll?.takeIf { it.sessionId == meeting.id },
+        mp4Queued = meeting.id in mp4QueuedIds,
+        mp4Eligible = meeting.phase == "completed" &&
+            meeting.audioFileName?.endsWith(".m4a", ignoreCase = true) == true,
+        mp4EligibilityNote = if (meeting.phase != "completed") null else when {
+            meeting.audioFileName.isNullOrBlank() ->
+                "This meeting has no retained audio, so no MP4 can be exported."
+            !meeting.audioFileName.endsWith(".m4a", ignoreCase = true) ->
+                "This meeting retains legacy WAV audio; the MP4 export needs the AAC M4A format."
+            else -> null
+        },
+        hasExportedMp4 = !meeting.exportedMp4Uri.isNullOrBlank(),
+        mp4ExportError = meeting.mp4ExportError,
         transcriptAvailable = transcriptAvailable,
         exportError = folderError ?: meeting.errorMessage?.takeIf { it.startsWith(MeetingStorageManager.EXPORT_ERROR_PREFIX) },
         onNotesChanged = { notes = it },
@@ -248,6 +293,19 @@ fun MeetingDetailScreen(
             scope.launch(Dispatchers.IO) {
                 runCatching { MeetingStorageManager.syncRecordingArtifacts(context.applicationContext, store, meeting.id) }
             }
+        },
+        onExportMp4 = {
+            // Manual export: audio/SRT first, then a forced MP4 request that
+            // bypasses (without changing) the Settings toggle.
+            scope.launch(Dispatchers.IO) {
+                MeetingStorageManager.syncRecordingArtifacts(context.applicationContext, store, meeting.id)
+                com.phequals7.muesli.meetings.MeetingMp4ExportService.requestExport(
+                    context.applicationContext, meeting.id, force = true
+                )
+            }
+        },
+        onCancelMp4Export = {
+            com.phequals7.muesli.meetings.MeetingMp4ExportService.cancel(context, meeting.id)
         },
         onChooseFolder = { chooseFolder() },
         onShareTranscript = { formatted ->
@@ -296,6 +354,12 @@ private fun MeetingDetailContent(
     aiSummary: String?,
     summaryState: String,
     summaryProgress: com.phequals7.muesli.meetings.SummaryProgress?,
+    mp4Progress: com.phequals7.muesli.meetings.Mp4ExportProgress?,
+    mp4Queued: Boolean,
+    mp4Eligible: Boolean,
+    mp4EligibilityNote: String?,
+    hasExportedMp4: Boolean,
+    mp4ExportError: String?,
     transcriptAvailable: Boolean,
     exportError: String?,
     onNotesChanged: (String) -> Unit,
@@ -303,6 +367,8 @@ private fun MeetingDetailContent(
     onCancelSummary: () -> Unit,
     onChooseFolder: () -> Unit,
     onRetryExport: () -> Unit,
+    onExportMp4: () -> Unit,
+    onCancelMp4Export: () -> Unit,
     onShareTranscript: (String) -> Unit,
     onDelete: () -> Unit,
     onNavigateBack: () -> Unit
@@ -463,6 +529,25 @@ private fun MeetingDetailContent(
                     ) {
                         Text("Share")
                     }
+                    var mp4MenuOpen by remember { mutableStateOf(false) }
+                    val mp4Busy = mp4Progress != null || mp4Queued
+                    IconButton(onClick = { mp4MenuOpen = true }) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "More actions")
+                    }
+                    DropdownMenu(expanded = mp4MenuOpen, onDismissRequest = { mp4MenuOpen = false }) {
+                        DropdownMenuItem(
+                            text = { Text(if (hasExportedMp4) "Regenerate MP4" else "Export MP4") },
+                            onClick = { mp4MenuOpen = false; onExportMp4() },
+                            enabled = mp4Eligible && !mp4Busy
+                        )
+                        if (mp4EligibilityNote != null) {
+                            DropdownMenuItem(
+                                text = { Text(mp4EligibilityNote, style = MaterialTheme.typography.labelSmall) },
+                                onClick = {},
+                                enabled = false
+                            )
+                        }
+                    }
                     TextButton(onClick = onDelete) {
                         Text("Delete", color = MaterialTheme.colorScheme.error)
                     }
@@ -524,6 +609,63 @@ private fun MeetingDetailContent(
                     TextButton(onClick = onRetryExport) {
                         Text("Retry export")
                     }
+                }
+            }
+            val activeMp4Progress = mp4Progress
+            if (activeMp4Progress != null) {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 4.dp),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = if (activeMp4Progress.cancelling) "Cancelling MP4 export…"
+                                else "${activeMp4Progress.stage}…",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold
+                            )
+                            LinearProgressIndicator(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 6.dp)
+                            )
+                        }
+                        TextButton(
+                            onClick = onCancelMp4Export,
+                            enabled = !activeMp4Progress.cancelling
+                        ) {
+                            Text("Cancel", color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                }
+            } else if (mp4Queued) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = 12.dp)) {
+                    Text("MP4 export queued…", style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
+                    TextButton(onClick = onCancelMp4Export) { Text("Cancel") }
+                }
+            }
+            if (mp4ExportError != null && mp4Progress == null) {
+                Text(
+                    mp4ExportError,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 4.dp)
+                )
+                TextButton(
+                    onClick = onExportMp4,
+                    enabled = mp4Eligible,
+                    modifier = Modifier.padding(horizontal = 12.dp)
+                ) {
+                    Text("Retry MP4 export")
                 }
             }
             TabRow(selectedTabIndex = selectedTabIndex) {

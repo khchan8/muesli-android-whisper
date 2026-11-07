@@ -7,8 +7,10 @@ import com.phequals7.muesli.data.entity.DictationResult
 import com.phequals7.muesli.data.entity.RecordingSession
 import com.phequals7.muesli.data.entity.Transcript
 import com.phequals7.muesli.data.entity.MeetingTranscriptSegmentEntity
+import androidx.room.withTransaction
+import com.phequals7.muesli.data.dao.Mp4SegmentProjection
+import com.phequals7.muesli.data.dao.toMp4Projection
 import kotlinx.coroutines.flow.Flow
-import java.util.UUID
 
 class SharedStore(private val context: Context) {
     private val database = AppDatabase.getDatabase(context)
@@ -47,6 +49,34 @@ class SharedStore(private val context: Context) {
         private const val KEY_CUSTOM_SUMMARY_MODEL = "custom_summary_model"
         private const val KEY_RECORDINGS_TREE_URI = "recordings_tree_uri"
         private const val KEY_LANGUAGE_HINT = "language_hint" // "auto", "en", "th", "zh", "yue"
+        private const val KEY_EXPORT_EMBEDDED_MP4 = "export_embedded_mp4_enabled"
+
+        /**
+         * Pure snapshot-validation predicate shared by pre-publish validation
+         * and the transactional MP4 commit: compares the persisted session
+         * fields and rendered segment projection `{orderIndex,startMs,endMs,speakerLabel,text}`
+         * while ignoring notes, summary text, profile embeddings and badge colors.
+         */
+        internal fun matchesMp4Snapshot(
+            session: RecordingSession?,
+            currentSegments: List<Mp4SegmentProjection>,
+            expectedAudioPath: String?,
+            expectedAudioUri: String,
+            expectedSrtUri: String?,
+            expectedTitle: String,
+            expectedOldMp4Uri: String?,
+            expectedSegments: List<Mp4SegmentProjection>
+        ): Boolean {
+            if (session == null) return false
+            if (session.phase != "completed" ||
+                session.audioFileName != expectedAudioPath ||
+                session.exportedAudioUri != expectedAudioUri ||
+                session.exportedSrtUri != expectedSrtUri ||
+                session.title != expectedTitle ||
+                session.exportedMp4Uri != expectedOldMp4Uri
+            ) return false
+            return currentSegments == expectedSegments
+        }
     }
 
     // Onboarding settings
@@ -147,6 +177,12 @@ class SharedStore(private val context: Context) {
     var recordingsTreeUri: String
         get() = prefs.getString(KEY_RECORDINGS_TREE_URI, "") ?: ""
         set(value) = prefs.edit().putString(KEY_RECORDINGS_TREE_URI, value).apply()
+
+    /** Also export a same-basename `.mp4` (canvas video + copied audio +
+     *  embedded tx3g transcript subtitles) after the SRT stage; default off. */
+    var exportEmbeddedMp4Enabled: Boolean
+        get() = prefs.getBoolean(KEY_EXPORT_EMBEDDED_MP4, false)
+        set(value) = prefs.edit().putBoolean(KEY_EXPORT_EMBEDDED_MP4, value).apply()
     var userProfileName: String
         get() = prefs.getString(KEY_USER_PROFILE_NAME, "") ?: ""
         set(value) = prefs.edit().putString(KEY_USER_PROFILE_NAME, value).apply()
@@ -257,4 +293,103 @@ class SharedStore(private val context: Context) {
 
     suspend fun getSessionsWithGeneratingSummary(): List<com.phequals7.muesli.data.dao.SummaryGeneratingRow> =
         recordingSessionDao.getSessionsWithGeneratingSummary()
+    // MP4 embedded-subtitle export (Room v8)
+
+    suspend fun updateExportedMp4Uri(
+        sessionId: String,
+        expectedAudioPath: String?,
+        expectedAudioUri: String,
+        expectedSrtUri: String?,
+        expectedTitle: String,
+        expectedOldMp4Uri: String?,
+        mp4Uri: String,
+        fingerprint: String?
+    ): Int = recordingSessionDao.updateExportedMp4Uri(
+        sessionId, expectedAudioPath, expectedAudioUri, expectedSrtUri,
+        expectedTitle, expectedOldMp4Uri, mp4Uri, fingerprint
+    )
+    suspend fun restoreExportedMp4Uri(
+        sessionId: String,
+        expectedOldMp4Uri: String?,
+        mp4Uri: String,
+        fingerprint: String?
+    ): Int = recordingSessionDao.restoreExportedMp4Uri(
+        sessionId, expectedOldMp4Uri, mp4Uri, fingerprint
+    )
+
+    suspend fun updateMp4ExportError(sessionId: String, message: String?): Int =
+        recordingSessionDao.updateMp4ExportError(sessionId, message)
+
+    /**
+     * One Room transaction: re-reads the session and its segment projection
+     * and reports whether they still match the captured MP4 snapshot inputs
+     * (notes, summary text, profile embeddings and badge colors ignored).
+     */
+    suspend fun validateMp4Snapshot(
+        sessionId: String,
+        expectedAudioPath: String,
+        expectedAudioUri: String,
+        expectedSrtUri: String?,
+        expectedTitle: String,
+        expectedOldMp4Uri: String?,
+        expectedSegments: List<Mp4SegmentProjection>
+    ): Boolean = database.withTransaction {
+        val session = recordingSessionDao.getSessionById(sessionId)
+        val current = transcriptSegmentDao.getSegmentsForSession(sessionId).map { it.toMp4Projection() }
+        matchesMp4Snapshot(
+            session = session,
+            currentSegments = current,
+            expectedAudioPath = expectedAudioPath,
+            expectedAudioUri = expectedAudioUri,
+            expectedSrtUri = expectedSrtUri,
+            expectedTitle = expectedTitle,
+            expectedOldMp4Uri = expectedOldMp4Uri,
+            expectedSegments = expectedSegments
+        )
+    }
+
+    /**
+     * Single Room transaction: validates the persisted session fields and
+     * rendered segment projection `{orderIndex,startMs,endMs,speakerLabel,text}`
+     * against the captured snapshot (ignoring notes, summary text, profile
+     * embeddings and badge colors) and, only when they match, executes the
+     * guarded MP4 URI + fingerprint commit.
+     */
+    suspend fun commitMp4Export(
+        sessionId: String,
+        expectedAudioPath: String,
+        expectedAudioUri: String,
+        expectedSrtUri: String?,
+        expectedTitle: String,
+        expectedOldMp4Uri: String?,
+        expectedSegments: List<Mp4SegmentProjection>,
+        mp4Uri: String,
+        fingerprint: String?
+    ): Boolean = database.withTransaction {
+        val session = recordingSessionDao.getSessionById(sessionId)
+        val current = transcriptSegmentDao.getSegmentsForSession(sessionId).map { it.toMp4Projection() }
+        if (!matchesMp4Snapshot(
+                session = session,
+                currentSegments = current,
+                expectedAudioPath = expectedAudioPath,
+                expectedAudioUri = expectedAudioUri,
+                expectedSrtUri = expectedSrtUri,
+                expectedTitle = expectedTitle,
+                expectedOldMp4Uri = expectedOldMp4Uri,
+                expectedSegments = expectedSegments
+            )
+        ) {
+            return@withTransaction false
+        }
+        recordingSessionDao.updateExportedMp4Uri(
+            sessionId = sessionId,
+            expectedAudioPath = expectedAudioPath,
+            expectedAudioUri = expectedAudioUri,
+            expectedSrtUri = expectedSrtUri,
+            expectedTitle = expectedTitle,
+            expectedOldMp4Uri = expectedOldMp4Uri,
+            mp4Uri = mp4Uri,
+            fingerprint = fingerprint
+        ) == 1
+    }
 }
