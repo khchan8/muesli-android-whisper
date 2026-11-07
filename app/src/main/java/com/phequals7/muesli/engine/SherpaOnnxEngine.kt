@@ -172,13 +172,20 @@ object SherpaRecognizerHolder {
         warmState = WarmState.IDLE
     }
 
+    /**
+     * Releases ASR weights and holds the recognizer mutex across [block] so
+     * launch/IME prewarm cannot reload ONNX models while the on-device LLM is
+     * in memory.
+     */
+    suspend fun <T> withReleasedRecognizer(block: suspend () -> T): T = mutex.withLock {
+        releaseInternal()
+        warmState = WarmState.IDLE
+        block()
+    }
+
     fun reset() {
         warmState = WarmState.IDLE
-        primaryRecognizer?.release()
-        primaryRecognizer = null
-        companionThaiRecognizer?.release()
-        companionThaiRecognizer = null
-        activeModelType = null
+        prewarmExecutor.execute { runBlocking { release() } }
     }
 
     /**
@@ -282,14 +289,17 @@ object SherpaRecognizerHolder {
     ): TranscriptionResult = transcribe(context, listOf(samples), languageHint)
 
     private fun releaseInternal() {
+        // JNI release can surface as UnsatisfiedLinkError (an Error); each
+        // recognizer is released independently so one failure cannot leak
+        // the other or leave the holder half-released.
         try {
             companionThaiRecognizer?.release()
-        } catch (_: Exception) {}
+        } catch (_: Throwable) {}
         companionThaiRecognizer = null
 
         try {
             primaryRecognizer?.release()
-        } catch (_: Exception) {}
+        } catch (_: Throwable) {}
         primaryRecognizer = null
         activeModelType = null
     }

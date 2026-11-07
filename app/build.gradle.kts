@@ -10,14 +10,29 @@ plugins {
 android {
     namespace = "com.phequals7.muesli"
     compileSdk = 36
+    ndkVersion = "29.0.13113456"
     defaultConfig {
         applicationId = "com.phequals7.muesli"
         minSdk = 24
         targetSdk = 36
         versionCode = 4
         versionName = "2.0.0-alpha"
+        ndk {
+            // Matches the shipped sherpa-onnx arm64-v8a libraries.
+            abiFilters += "arm64-v8a"
+        }
+        externalNativeBuild {
+            cmake {
+                arguments += "-DANDROID_STL=c++_static"
+            }
+        }
     }
-
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.31.6"
+        }
+    }
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -46,6 +61,10 @@ android {
     lint {
         // False positive on ComponentActivity with this toolchain (SDK XML v4 tooling mismatch).
         disable += "Instantiatable"
+    }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
     }
 }
 
@@ -82,7 +101,8 @@ dependencies {
   testImplementation(libs.junit)
   testImplementation(libs.kotlinx.coroutines.test)
   testImplementation(libs.mockwebserver)
-
+  // org.json android.jar stubs throw in JVM tests; use the real artifact.
+  testImplementation("org.json:json:20240303")
   // Instrumented tests: Room migration tests
   androidTestImplementation(libs.room.testing)
 

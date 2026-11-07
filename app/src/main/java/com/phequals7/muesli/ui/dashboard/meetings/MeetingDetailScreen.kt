@@ -2,17 +2,21 @@ package com.phequals7.muesli.ui.dashboard.meetings
 
 import android.content.Intent
 import android.media.MediaPlayer
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -20,22 +24,21 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
@@ -45,7 +48,6 @@ import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -60,21 +62,20 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.phequals7.muesli.data.AppDatabase
 import com.phequals7.muesli.data.SharedStore
 import com.phequals7.muesli.data.entity.MeetingTranscriptSegmentEntity
 import com.phequals7.muesli.data.entity.RecordingSession
 import com.phequals7.muesli.meetings.DiarizedTranscriptSegment
-import com.phequals7.muesli.meetings.RawTranscriptChunk
-import com.phequals7.muesli.meetings.SpeakerDiarizer
-import com.phequals7.muesli.meetings.SpeakerProfileRecord
+import com.phequals7.muesli.meetings.MeetingStorageManager
+import com.phequals7.muesli.meetings.MeetingTranscriptSrt
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -116,9 +117,9 @@ fun findActiveTranscriptSegmentIndex(
 }
 
 /**
- * Meeting detail for v2.0: block-level synchronized audio-text playback, one-tap
- * speaker profile enrollment (persistent CAM++ voiceprints), speaker-count
- * re-diarization, and public `/sdcard/Recordings/Muesli` playback.
+ * Meeting detail: transcript-first playback. A compact play/pause + seek strip
+ * leaves the whole height to the subtitle cues, which follow playback
+ * automatically (a manual drag pauses following for four seconds).
  */
 @Composable
 fun MeetingDetailScreen(
@@ -128,32 +129,63 @@ fun MeetingDetailScreen(
     onDeleted: () -> Unit,
 ) {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    val profileStore = remember { AppDatabase.getSpeakerProfileStore(context.applicationContext) }
 
     val segmentEntities by store.getTranscriptSegmentsFlow(meeting.id)
         .collectAsState(initial = emptyList<MeetingTranscriptSegmentEntity>())
     val segments = remember(segmentEntities) { segmentEntities.map { it.toDomainModel() } }
-    val enrolledProfiles by profileStore.observeProfiles()
-        .collectAsState(initial = emptyList<SpeakerProfileRecord>())
-
+    val transcriptRow by store.getTranscriptForSessionFlow(meeting.id)
+        .collectAsState(initial = null)
     var notes by remember { mutableStateOf(meeting.manualNotes) }
-    var isReDiarizing by remember { mutableStateOf(false) }
-    var reDiarizationProgress by remember { mutableFloatStateOf(0f) }
-
-    // Debounced notes persistence (600 ms, same as v0.3.x).
+    val summaryProgress by com.phequals7.muesli.meetings.MeetingSummaryService.progress.collectAsState()
+    val scope = rememberCoroutineScope()
+    var folderError by remember { mutableStateOf<String?>(null) }
+    val chooseFolder = com.phequals7.muesli.meetings.rememberRecordingsFolderPicker(
+        store,
+        onSelected = {
+            folderError = null
+            scope.launch(Dispatchers.IO) {
+                MeetingStorageManager.syncRecordingArtifacts(context.applicationContext, store, meeting.id)
+            }
+        }
+    ) { folderError = it }
+    fun leaveDetail() {
+        scope.launch {
+            if (notes != meeting.manualNotes) {
+                store.updateMeetingNotes(meeting.id, notes)
+                MeetingStorageManager.syncRecordingArtifacts(context.applicationContext, store, meeting.id)
+            }
+            onBack()
+        }
+    }
+    BackHandler { leaveDetail() }
     LaunchedEffect(notes) {
         if (notes == meeting.manualNotes) return@LaunchedEffect
         delay(600)
-        store.updateRecordingSession(meeting.copy(manualNotes = notes))
+        if (store.updateMeetingNotes(meeting.id, notes) > 0) {
+            MeetingStorageManager.syncRecordingArtifacts(context.applicationContext, store, meeting.id)
+        }
+    }
+
+    // Rows stuck `generating` by a dead process become retryable on entry.
+    LaunchedEffect(meeting.id) {
+        launch {
+            runCatching {
+                com.phequals7.muesli.meetings.MeetingSummaryService.reconcileStaleGenerating(context.applicationContext, store)
+            }
+        }
+    }
+
+    // Lazily materialize the SRT sidecar / normalize names for already
+    // completed recordings when detail is opened (once per id/path/title).
+    LaunchedEffect(meeting.id, meeting.audioFileName, meeting.title) {
+        launch(Dispatchers.IO) {
+            runCatching { MeetingStorageManager.syncRecordingArtifacts(context.applicationContext, store, meeting.id) }
+        }
     }
 
     // v2 recordings store an absolute /sdcard path; v0.3.x rows store a file name.
     val audioFilePath = remember(meeting.audioFileName) {
-        meeting.audioFileName?.let { name ->
-            if (name.startsWith("/")) name
-            else File(context.filesDir, "meetings/$name").absolutePath
-        }
+        MeetingStorageManager.resolveRecordingWav(context.filesDir, meeting.audioFileName)?.absolutePath
     }
 
     val dateLine = remember(meeting.id) {
@@ -166,59 +198,46 @@ fun MeetingDetailScreen(
         }
     }
 
+    val transcriptText = transcriptRow?.text.orEmpty()
+    val transcriptAvailable = remember(transcriptText, segments) {
+        transcriptText.isNotBlank() || segments.isNotEmpty()
+    }
+
     MeetingDetailContent(
-        sessionId = meeting.id,
+        meetingId = meeting.id,
+        meetingPhase = meeting.phase,
         meetingTitle = meeting.title,
         subtitleLine = dateLine,
         audioFilePath = audioFilePath,
         segments = segments,
-        enrolledProfiles = enrolledProfiles,
+        legacyFlatTranscript = transcriptText.takeIf { it.isNotBlank() },
         manualNotes = notes,
         aiSummary = meeting.summaryText.takeIf { it.isNotBlank() },
-        isReDiarizing = isReDiarizing,
-        reDiarizationProgress = reDiarizationProgress,
+        summaryState = meeting.summaryState,
+        summaryProgress = summaryProgress,
+        transcriptAvailable = transcriptAvailable,
+        exportError = folderError ?: meeting.errorMessage?.takeIf { it.startsWith(MeetingStorageManager.EXPORT_ERROR_PREFIX) },
         onNotesChanged = { notes = it },
-        onAssignSpeakerProfile = { clusterId, centroid, displayName, existingProfileId, badgeColorHex ->
+        onGenerateSummary = {
+            // Save the current draft before dispatch so manual notes are
+            // never lost to the summary's own retention step.
             scope.launch {
-                SpeakerDiarizer(context.applicationContext, profileStore).enrollOrUpdateSpeakerProfile(
-                    sessionId = meeting.id,
-                    clusterId = clusterId,
-                    clusterCentroid = centroid,
-                    displayName = displayName,
-                    existingProfileId = existingProfileId,
-                    badgeColorHex = badgeColorHex
-                )
-            }
-        },
-        onReDiarizeWithSpeakerCount = { expectedSpeakers ->
-            val wav = audioFilePath?.let { File(it) }?.takeIf { it.exists() && it.length() > 44L }
-            if (wav == null || segments.isEmpty() || isReDiarizing) return@MeetingDetailContent
-            scope.launch {
-                isReDiarizing = true
-                reDiarizationProgress = 0.02f
-                try {
-                    val rawChunks = segments.map {
-                        RawTranscriptChunk(it.startMs, it.endMs, it.text, it.languageCode)
-                    }
-                    val result = SpeakerDiarizer(context.applicationContext, profileStore).diarizeWavAndAlign(
-                        sessionId = meeting.id,
-                        wavFile = wav,
-                        rawChunks = rawChunks,
-                        expectedSpeakerCount = expectedSpeakers,
-                        onProgress = { p -> reDiarizationProgress = p }
-                    )
-                    store.replaceTranscriptSegments(
-                        meeting.id,
-                        result.segments.map { MeetingTranscriptSegmentEntity.fromDomainModel(it) },
-                        result.formattedInlineTranscript
-                    )
-                } catch (t: Throwable) {
-                    android.util.Log.w("MeetingDetail", "Re-diarization failed: ${t.message}")
-                } finally {
-                    isReDiarizing = false
+                if (notes != meeting.manualNotes) {
+                    store.updateMeetingNotes(meeting.id, notes)
+                    MeetingStorageManager.syncRecordingArtifacts(context.applicationContext, store, meeting.id)
                 }
+                com.phequals7.muesli.meetings.MeetingSummaryService.generate(context, meeting.id)
             }
         },
+        onCancelSummary = {
+            com.phequals7.muesli.meetings.MeetingSummaryService.cancel(context, meeting.id)
+        },
+        onRetryExport = {
+            scope.launch(Dispatchers.IO) {
+                runCatching { MeetingStorageManager.syncRecordingArtifacts(context.applicationContext, store, meeting.id) }
+            }
+        },
+        onChooseFolder = { chooseFolder() },
         onShareTranscript = { formatted ->
             val body = buildString {
                 append(meeting.title).append("\n").append(dateLine).append("\n\n")
@@ -235,49 +254,47 @@ fun MeetingDetailScreen(
         },
         onDelete = {
             scope.launch {
+                com.phequals7.muesli.meetings.MeetingSummaryService.cancel(context, meeting.id)
                 store.deleteRecordingSession(meeting)
                 onDeleted()
             }
         },
-        onNavigateBack = onBack,
+        onNavigateBack = { leaveDetail() },
     )
 }
 
 /**
  * Parametrized meeting detail surface supporting:
  * 1. Block-level synchronized audio-text highlighting during playback (80ms position polling + O(log N) binary search).
- * 2. Smooth auto-scrolling to the active transcript block with a 4-second manual scroll cooldown and "Follow Text" toggle.
- * 3. Tap-any-block to seek audio playback directly to `segment.startMs`.
- * 4. One-tap Speaker Profile labeling & enrollment bottom sheet (saving 192-dim CAM++ centroids to recognize the speaker in future meetings).
- * 5. Constrained speaker count re-diarization selector (`Auto`, `2`, `3`, `4`, `5+` speakers) and public `/sdcard/Recordings/Muesli` path indicator.
+ * 2. Automatic following of the active cue; a user drag suspends following for four seconds after release.
+ * 3. Tap-any-cue to seek audio playback directly to `segment.startMs`.
+ * 4. A compact 56dp play/pause + slider + time strip so the transcript keeps the screen.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun MeetingDetailContent(
-    sessionId: String,
+    meetingId: String,
+    meetingPhase: String,
     meetingTitle: String,
     subtitleLine: String,
     audioFilePath: String?,
     segments: List<DiarizedTranscriptSegment>,
-    enrolledProfiles: List<SpeakerProfileRecord>,
+    legacyFlatTranscript: String?,
     manualNotes: String,
     aiSummary: String?,
-    isReDiarizing: Boolean = false,
-    reDiarizationProgress: Float = 0f,
+    summaryState: String,
+    summaryProgress: com.phequals7.muesli.meetings.SummaryProgress?,
+    transcriptAvailable: Boolean,
+    exportError: String?,
     onNotesChanged: (String) -> Unit,
-    onAssignSpeakerProfile: (
-        clusterId: Int,
-        clusterCentroid: FloatArray,
-        displayName: String,
-        existingProfileId: String?,
-        badgeColorHex: String
-    ) -> Unit,
-    onReDiarizeWithSpeakerCount: (expectedSpeakers: Int) -> Unit,
+    onGenerateSummary: () -> Unit,
+    onCancelSummary: () -> Unit,
+    onChooseFolder: () -> Unit,
+    onRetryExport: () -> Unit,
     onShareTranscript: (String) -> Unit,
     onDelete: () -> Unit,
     onNavigateBack: () -> Unit
 ) {
-    val coroutineScope = rememberCoroutineScope()
     val lazyListState = rememberLazyListState()
 
     // Audio playback state
@@ -287,20 +304,21 @@ private fun MeetingDetailContent(
     var isUserDraggingSeekSlider by remember { mutableStateOf(false) }
     var sliderPreviewMs by remember { mutableFloatStateOf(0f) }
 
-    // Manual scroll cooldown tracking so user scrolling is not hijacked
+    // Manual drag cooldown: following resumes four seconds after the user releases a drag.
     var lastUserManualScrollMs by remember { mutableLongStateOf(0L) }
-    var autoFollowEnabled by remember { mutableStateOf(true) }
+    val isDragged by lazyListState.interactionSource.collectIsDraggedAsState()
+    var wasDragged by remember { mutableStateOf(false) }
+    LaunchedEffect(isDragged) {
+        if (isDragged || wasDragged) lastUserManualScrollMs = System.currentTimeMillis()
+        wasDragged = isDragged
+    }
 
-    // Tabs: 0 = Transcript (Synced), 1 = Notes & AI Summary
+    // Tabs: 0 = Transcript, 1 = Summary
     var selectedTabIndex by remember { mutableIntStateOf(0) }
 
-    // Speaker Count Hint filter for re-running CAM++ diarization
-    var selectedSpeakerCountHint by remember { mutableIntStateOf(-1) }
+    // Same normalization as the on-disk SRT: on-screen cues and sidecars cannot diverge.
+    val cues = remember(segments) { MeetingTranscriptSrt.normalizedSegments(segments) }
 
-    // Speaker Profile labeling ModalBottomSheet state
-    var segmentForSpeakerLabeling by remember { mutableStateOf<DiarizedTranscriptSegment?>(null) }
-
-    // Initialize and manage Android MediaPlayer for /sdcard/Recordings/Muesli/<session>.wav
     val wavFile = remember(audioFilePath) {
         audioFilePath?.let { File(it) }?.takeIf { it.exists() && it.length() > 44L }
     }
@@ -311,7 +329,6 @@ private fun MeetingDetailContent(
                 MediaPlayer().apply {
                     setDataSource(wavFile.absolutePath)
                     prepare()
-                    totalDurationMs = duration.toLong().coerceAtLeast(1L)
                     setOnCompletionListener {
                         isPlaying = false
                         currentPositionMs = totalDurationMs
@@ -334,39 +351,48 @@ private fun MeetingDetailContent(
         }
     }
 
+    // A path change (title-driven rename) rebinds the player: reset transport state.
+    LaunchedEffect(mediaPlayer) {
+        isPlaying = false
+        currentPositionMs = 0L
+        totalDurationMs = try {
+            mediaPlayer?.duration?.toLong()?.coerceAtLeast(1L) ?: 0L
+        } catch (_: Exception) {
+            0L
+        }
+    }
+
     // 80ms reactive playback position ticker while audio is playing
     LaunchedEffect(mediaPlayer, isPlaying) {
         while (isActive && isPlaying && mediaPlayer != null) {
             if (!isUserDraggingSeekSlider) {
-                currentPositionMs = mediaPlayer.currentPosition.toLong()
+                try {
+                    currentPositionMs = mediaPlayer.currentPosition.toLong()
+                } catch (_: IllegalStateException) {
+                    // Player was released/rebound mid-poll.
+                    isPlaying = false
+                }
             }
             delay(80L)
         }
     }
 
-    // Track manual user touch scrolling in the transcript LazyColumn
-    LaunchedEffect(lazyListState.isScrollInProgress) {
-        if (lazyListState.isScrollInProgress && isPlaying) {
-            lastUserManualScrollMs = System.currentTimeMillis()
-        }
+    // Compute active transcript cue index via binary search
+    val activeSegmentIndex = remember(cues, currentPositionMs) {
+        findActiveTranscriptSegmentIndex(cues, currentPositionMs)
     }
 
-    // Compute active transcript block index via binary search
-    val activeSegmentIndex = remember(segments, currentPositionMs) {
-        findActiveTranscriptSegmentIndex(segments, currentPositionMs)
-    }
-
-    // Auto-scroll LazyColumn to keep the highlighted block centered during playback
-    LaunchedEffect(activeSegmentIndex, isPlaying, autoFollowEnabled) {
-        if (isPlaying && autoFollowEnabled && selectedTabIndex == 0 && activeSegmentIndex in segments.indices) {
-            val cooldownElapsed = (System.currentTimeMillis() - lastUserManualScrollMs) > 4000L
-            if (cooldownElapsed) {
-                lazyListState.animateScrollToItem(
-                    index = activeSegmentIndex,
-                    scrollOffset = -160
-                )
-            }
-        }
+    // Follow the active cue while playing on the Transcript tab. Restarting on
+    // any key change prevents stale scroll targets.
+    LaunchedEffect(activeSegmentIndex, isPlaying, selectedTabIndex, isDragged, lastUserManualScrollMs) {
+        if (!isPlaying || selectedTabIndex != 0 || isDragged) return@LaunchedEffect
+        if (activeSegmentIndex !in cues.indices) return@LaunchedEffect
+        val cooldownRemaining = MANUAL_SCROLL_COOLDOWN_MS - (System.currentTimeMillis() - lastUserManualScrollMs)
+        if (cooldownRemaining > 0L) delay(cooldownRemaining)
+        lazyListState.animateScrollToItem(
+            index = activeSegmentIndex,
+            scrollOffset = -160
+        )
     }
 
     fun seekToMs(targetMs: Long, autoPlay: Boolean = true) {
@@ -374,6 +400,8 @@ private fun MeetingDetailContent(
         val clamped = targetMs.coerceIn(0L, totalDurationMs.coerceAtLeast(1L))
         player.seekTo(clamped.toInt())
         currentPositionMs = clamped
+        // An explicit seek re-anchors following to the user's chosen position.
+        lastUserManualScrollMs = 0L
         if (autoPlay && !player.isPlaying) {
             player.start()
             isPlaying = true
@@ -404,15 +432,19 @@ private fun MeetingDetailContent(
                     }
                 },
                 navigationIcon = {
-                    TextButton(onClick = onNavigateBack) {
-                        Text("Back")
+                    IconButton(onClick = onNavigateBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
                 actions = {
                     TextButton(
                         onClick = {
-                            val formatted = segments.joinToString("\n\n") { seg ->
-                                "[${formatDurationMs(seg.startMs)}] ${seg.speakerLabel}: ${seg.text}"
+                            val formatted = if (cues.isNotEmpty()) {
+                                cues.joinToString("\n\n") { seg ->
+                                    "[${formatDurationMs(seg.startMs)}] ${seg.speakerLabel}: ${seg.text}"
+                                }
+                            } else {
+                                legacyFlatTranscript.orEmpty()
                             }
                             onShareTranscript(formatted)
                         }
@@ -427,11 +459,10 @@ private fun MeetingDetailContent(
         },
         bottomBar = {
             if (mediaPlayer != null && wavFile != null) {
-                SynchronizedAudioPlayerBar(
+                CompactPlayerBar(
                     isPlaying = isPlaying,
                     currentPositionMs = if (isUserDraggingSeekSlider) sliderPreviewMs.toLong() else currentPositionMs,
                     totalDurationMs = totalDurationMs,
-                    autoFollowEnabled = autoFollowEnabled,
                     onTogglePlayPause = {
                         if (mediaPlayer.isPlaying) {
                             mediaPlayer.pause()
@@ -445,8 +476,6 @@ private fun MeetingDetailContent(
                             isPlaying = true
                         }
                     },
-                    onSkipBackward10s = { seekToMs(currentPositionMs - 10_000L, autoPlay = isPlaying) },
-                    onSkipForward10s = { seekToMs(currentPositionMs + 10_000L, autoPlay = isPlaying) },
                     onSeekValueChange = { newValue ->
                         isUserDraggingSeekSlider = true
                         sliderPreviewMs = newValue
@@ -454,15 +483,6 @@ private fun MeetingDetailContent(
                     onSeekValueChangeFinished = {
                         seekToMs(sliderPreviewMs.toLong(), autoPlay = isPlaying)
                         isUserDraggingSeekSlider = false
-                    },
-                    onToggleAutoFollow = {
-                        autoFollowEnabled = !autoFollowEnabled
-                        lastUserManualScrollMs = 0L
-                        if (autoFollowEnabled && activeSegmentIndex in segments.indices) {
-                            coroutineScope.launch {
-                                lazyListState.animateScrollToItem(activeSegmentIndex, scrollOffset = -160)
-                            }
-                        }
                     }
                 )
             }
@@ -473,237 +493,128 @@ private fun MeetingDetailContent(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
+            exportError?.let { err ->
+                Text(
+                    err,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 4.dp)
+                )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    modifier = Modifier.padding(horizontal = 12.dp)
+                ) {
+                    TextButton(onClick = onChooseFolder) {
+                        Text("Choose recordings folder")
+                    }
+                    TextButton(onClick = onRetryExport) {
+                        Text("Retry export")
+                    }
+                }
+            }
             TabRow(selectedTabIndex = selectedTabIndex) {
                 Tab(
                     selected = selectedTabIndex == 0,
                     onClick = { selectedTabIndex = 0 },
-                    text = { Text("Transcript (${segments.size} blocks)") }
+                    text = { Text("Transcript") }
                 )
                 Tab(
                     selected = selectedTabIndex == 1,
                     onClick = { selectedTabIndex = 1 },
-                    text = { Text("Notes & Summary") }
+                    text = { Text("Summary") }
                 )
-            }
-
-            if (isReDiarizing) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 8.dp)
-                ) {
-                    Text(
-                        text = "Running CAM++ Speaker Diarization & Profile Matching... ${(reDiarizationProgress * 100).toInt()}%",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    LinearProgressIndicator(
-                        progress = { reDiarizationProgress.coerceIn(0f, 1f) },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
             }
 
             when (selectedTabIndex) {
                 0 -> {
-                    if (segments.isEmpty()) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .padding(24.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = "No speech was transcribed.",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
+                    if (cues.isEmpty()) {
+                        if (!legacyFlatTranscript.isNullOrBlank()) {
+                            LazyColumn(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .weight(1f),
+                                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)
+                            ) {
+                                item {
+                                    Text(
+                                        text = legacyFlatTranscript,
+                                        style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 22.sp),
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
+                            }
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(24.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = "No speech was transcribed.",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                         }
                     } else {
-                        // Speaker overview + Speaker Count constraint bar
-                        SpeakerControlHeaderBar(
-                            segments = segments,
-                            selectedSpeakerCountHint = selectedSpeakerCountHint,
-                            onSelectSpeakerCountHint = { count ->
-                                selectedSpeakerCountHint = count
-                                onReDiarizeWithSpeakerCount(count)
-                            },
-                            onSpeakerChipClicked = { sampleSegment ->
-                                segmentForSpeakerLabeling = sampleSegment
-                            }
-                        )
-
-                        HorizontalDivider()
-
-                        // Block-level synchronized transcript LazyColumn
+                        // Synchronized cue list gets the remaining height.
                         LazyColumn(
                             state = lazyListState,
-                            modifier = Modifier.fillMaxSize(),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f),
                             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             itemsIndexed(
-                                items = segments,
+                                items = cues,
                                 key = { _, seg -> seg.segmentId }
                             ) { index, segment ->
-                                val isActiveBlock = (index == activeSegmentIndex) && (isPlaying || currentPositionMs > 0L)
-                                TranscriptSegmentBlockCard(
+                                TranscriptCueCard(
+                                    ordinal = index + 1,
                                     segment = segment,
-                                    isActiveBlock = isActiveBlock,
-                                    onBlockClick = {
-                                        // Tap any block to jump audio to segment.startMs and highlight
-                                        lastUserManualScrollMs = 0L
-                                        seekToMs(segment.startMs, autoPlay = true)
-                                    },
-                                    onSpeakerBadgeClick = {
-                                        segmentForSpeakerLabeling = segment
-                                    }
+                                    isActiveBlock = (index == activeSegmentIndex) && (isPlaying || currentPositionMs > 0L),
+                                    onCueClick = { seekToMs(segment.startMs, autoPlay = true) }
                                 )
                             }
                         }
                     }
                 }
                 1 -> {
-                    NotesAndSummaryTab(
+                    SummaryTab(
+                        meetingId = meetingId,
+                        meetingPhase = meetingPhase,
                         manualNotes = manualNotes,
                         aiSummary = aiSummary,
-                        onNotesChanged = onNotesChanged
+                        summaryState = summaryState,
+                        summaryProgress = summaryProgress,
+                        transcriptAvailable = transcriptAvailable,
+                        onNotesChanged = onNotesChanged,
+                        onGenerateSummary = onGenerateSummary,
+                        onCancelSummary = onCancelSummary
                     )
                 }
             }
         }
     }
 
-    // ModalBottomSheet for labeling a speaker and saving/updating their persistent voiceprint profile
-    val targetSegment = segmentForSpeakerLabeling
-    if (targetSegment != null) {
-        SpeakerProfileEnrollmentBottomSheet(
-            segment = targetSegment,
-            enrolledProfiles = enrolledProfiles,
-            onDismiss = { segmentForSpeakerLabeling = null },
-            onSaveSpeakerProfile = { displayName, existingProfileId, badgeColorHex ->
-                onAssignSpeakerProfile(
-                    targetSegment.clusterId,
-                    targetSegment.clusterCentroid,
-                    displayName,
-                    existingProfileId,
-                    badgeColorHex
-                )
-                segmentForSpeakerLabeling = null
-            }
-        )
-    }
 }
 
-@Composable
-private fun SpeakerControlHeaderBar(
-    segments: List<DiarizedTranscriptSegment>,
-    selectedSpeakerCountHint: Int,
-    onSelectSpeakerCountHint: (Int) -> Unit,
-    onSpeakerChipClicked: (DiarizedTranscriptSegment) -> Unit
-) {
-    val distinctClusters = remember(segments) {
-        segments.groupBy { it.clusterId }.map { (_, list) -> list.first() }
-    }
-    val countOptions = listOf(-1 to "Auto", 2 to "2 Spk", 3 to "3 Spk", 4 to "4 Spk", 5 to "5+ Spk")
-
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 8.dp)
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text(
-                text = "Speakers (${distinctClusters.size}) — tap a badge to label & save a voice profile:",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-
-        if (distinctClusters.isNotEmpty()) {
-            LazyRow(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                items(distinctClusters, key = { it.clusterId }) { sampleSeg ->
-                    val badgeColor = parseHexColor(sampleSeg.badgeColorHex)
-                    Surface(
-                        shape = RoundedCornerShape(16.dp),
-                        color = badgeColor.copy(alpha = 0.14f),
-                        border = BorderStroke(1.dp, badgeColor.copy(alpha = 0.55f)),
-                        modifier = Modifier.clickable { onSpeakerChipClicked(sampleSeg) }
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(8.dp)
-                                    .clip(CircleShape)
-                                    .background(badgeColor)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = if (sampleSeg.speakerProfileId != null) {
-                                    "${sampleSeg.speakerLabel} ✓"
-                                } else {
-                                    "${sampleSeg.speakerLabel} (Set Profile)"
-                                },
-                                style = MaterialTheme.typography.labelMedium,
-                                color = badgeColor,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        LazyRow(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 6.dp),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            item {
-                Text(
-                    text = "Speaker Count Hint:",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(end = 4.dp)
-                )
-            }
-            items(countOptions, key = { it.first }) { (countVal, label) ->
-                FilterChip(
-                    selected = selectedSpeakerCountHint == countVal,
-                    onClick = { onSelectSpeakerCountHint(countVal) },
-                    label = { Text(label, fontSize = 11.sp) }
-                )
-            }
-        }
-    }
-}
+private const val MANUAL_SCROLL_COOLDOWN_MS = 4_000L
 
 /**
- * Renders a single speaker-attributed transcript block card that highlights when
- * [isActiveBlock] is true during audio playback and seeks audio to
- * `segment.startMs` when tapped.
+ * Renders one subtitle cue: ordinal + full SRT timestamp range header, then
+ * `Speaker: text` inline. Tapping seeks playback to the cue start.
  */
 @Composable
-private fun TranscriptSegmentBlockCard(
+private fun TranscriptCueCard(
+    ordinal: Int,
     segment: DiarizedTranscriptSegment,
     isActiveBlock: Boolean,
-    onBlockClick: () -> Unit,
-    onSpeakerBadgeClick: () -> Unit
+    onCueClick: () -> Unit
 ) {
     val speakerColor = parseHexColor(segment.badgeColorHex)
     val backgroundColor by animateColorAsState(
@@ -724,7 +635,7 @@ private fun TranscriptSegmentBlockCard(
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { onBlockClick() },
+            .clickable { onCueClick() },
         shape = RoundedCornerShape(12.dp),
         colors = CardDefaults.cardColors(containerColor = backgroundColor),
         border = BorderStroke(if (isActiveBlock) 2.dp else 0.dp, borderColor)
@@ -734,63 +645,15 @@ private fun TranscriptSegmentBlockCard(
                 .fillMaxWidth()
                 .padding(12.dp)
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                // Clickable Speaker Profile Pill Badge
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = speakerColor.copy(alpha = 0.18f),
-                    modifier = Modifier.clickable { onSpeakerBadgeClick() }
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(7.dp)
-                                .clip(CircleShape)
-                                .background(speakerColor)
-                        )
-                        Spacer(modifier = Modifier.width(5.dp))
-                        Text(
-                            text = if (segment.speakerProfileId != null) {
-                                "${segment.speakerLabel} ✓"
-                            } else {
-                                segment.speakerLabel
-                            },
-                            style = MaterialTheme.typography.labelMedium,
-                            color = speakerColor,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    if (!segment.languageCode.isNullOrBlank() && segment.languageCode != "auto") {
-                        Text(
-                            text = segment.languageCode.uppercase(),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(end = 8.dp)
-                        )
-                    }
-                    Text(
-                        text = "${formatDurationMs(segment.startMs)} – ${formatDurationMs(segment.endMs)}",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = if (isActiveBlock) FontWeight.Bold else FontWeight.Normal,
-                        color = if (isActiveBlock) speakerColor else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(6.dp))
-
             Text(
-                text = segment.text,
+                text = "#$ordinal · ${MeetingTranscriptSrt.formatTimestamp(segment.startMs)} --> " +
+                    "${MeetingTranscriptSrt.formatTimestamp(segment.endMs)}",
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = if (isActiveBlock) FontWeight.Bold else FontWeight.Normal,
+                color = if (isActiveBlock) speakerColor else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = MeetingTranscriptSrt.cueText(segment).replace('\n', ' '),
                 style = MaterialTheme.typography.bodyMedium.copy(
                     lineHeight = 22.sp,
                     fontWeight = if (isActiveBlock) FontWeight.Medium else FontWeight.Normal
@@ -801,207 +664,141 @@ private fun TranscriptSegmentBlockCard(
     }
 }
 
+/** Compact one-line player: play/pause button, seek slider, elapsed/total time. */
 @Composable
-private fun SynchronizedAudioPlayerBar(
+private fun CompactPlayerBar(
     isPlaying: Boolean,
     currentPositionMs: Long,
     totalDurationMs: Long,
-    autoFollowEnabled: Boolean,
     onTogglePlayPause: () -> Unit,
-    onSkipBackward10s: () -> Unit,
-    onSkipForward10s: () -> Unit,
     onSeekValueChange: (Float) -> Unit,
-    onSeekValueChangeFinished: () -> Unit,
-    onToggleAutoFollow: () -> Unit
+    onSeekValueChangeFinished: () -> Unit
 ) {
     Surface(
         tonalElevation = 6.dp,
         shadowElevation = 8.dp,
         modifier = Modifier.fillMaxWidth()
     ) {
-        Column(
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 10.dp)
+                .padding(horizontal = 8.dp, vertical = 4.dp)
         ) {
+            IconButton(
+                onClick = onTogglePlayPause,
+                modifier = Modifier.size(48.dp)
+            ) {
+                Icon(
+                    imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                    contentDescription = if (isPlaying) "Pause" else "Play",
+                    tint = MaterialTheme.colorScheme.primary
+                )
+            }
             Slider(
                 value = currentPositionMs.toFloat().coerceIn(0f, totalDurationMs.toFloat().coerceAtLeast(1f)),
                 valueRange = 0f..totalDurationMs.toFloat().coerceAtLeast(1f),
                 onValueChange = onSeekValueChange,
                 onValueChangeFinished = onSeekValueChangeFinished,
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.weight(1f)
             )
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(
-                    text = "${formatDurationMs(currentPositionMs)} / ${formatDurationMs(totalDurationMs)}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    TextButton(onClick = onSkipBackward10s) {
-                        Text("-10s")
-                    }
-                    Button(
-                        onClick = onTogglePlayPause,
-                        shape = RoundedCornerShape(20.dp)
-                    ) {
-                        Text(if (isPlaying) "Pause" else "Play")
-                    }
-                    TextButton(onClick = onSkipForward10s) {
-                        Text("+10s")
-                    }
-                }
-
-                FilterChip(
-                    selected = autoFollowEnabled,
-                    onClick = onToggleAutoFollow,
-                    label = { Text("Follow Text", fontSize = 11.sp) }
-                )
-            }
+            Text(
+                text = "${formatDurationMs(currentPositionMs)} / ${formatDurationMs(totalDurationMs)}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                modifier = Modifier.padding(start = 8.dp)
+            )
         }
     }
 }
 
-/**
- * Bottom sheet for labeling a speaker cluster and saving their 192-dim CAM++ voiceprint
- * profile so Muesli automatically identifies them in future meetings.
- */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SpeakerProfileEnrollmentBottomSheet(
-    segment: DiarizedTranscriptSegment,
-    enrolledProfiles: List<SpeakerProfileRecord>,
-    onDismiss: () -> Unit,
-    onSaveSpeakerProfile: (displayName: String, existingProfileId: String?, badgeColorHex: String) -> Unit
+private fun SummaryTab(
+    meetingId: String,
+    meetingPhase: String,
+    manualNotes: String,
+    aiSummary: String?,
+    summaryState: String,
+    summaryProgress: com.phequals7.muesli.meetings.SummaryProgress?,
+    transcriptAvailable: Boolean,
+    onNotesChanged: (String) -> Unit,
+    onGenerateSummary: () -> Unit,
+    onCancelSummary: () -> Unit
 ) {
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    var customName by remember(segment) {
-        mutableStateOf(
-            if (segment.speakerLabel.startsWith("Speaker ")) "" else segment.speakerLabel
-        )
-    }
-    var selectedColorHex by remember(segment) { mutableStateOf(segment.badgeColorHex) }
+    val activeHere = summaryProgress?.sessionId == meetingId
+    val anotherSummary = summaryProgress != null && !activeHere
+    val recordingBusy = com.phequals7.muesli.meetings.MeetingRecordingController.isActive
 
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheetState
+    // Vertically scrollable so long summaries never hide the actions below.
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 20.dp, vertical = 12.dp)
-        ) {
-            Text(
-                text = "Label Speaker & Save Voice Profile",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                text = "Saving a profile stores this speaker's 192-dim CAM++ voiceprint so they are automatically recognized in future English, Thai, and Chinese meetings.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-
-            Spacer(modifier = Modifier.height(14.dp))
-
-            OutlinedTextField(
-                value = customName,
-                onValueChange = { customName = it },
-                label = { Text("Speaker Name (e.g., Khun Somchai, Alice)") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
-
-            Spacer(modifier = Modifier.height(12.dp))
-            Text(
-                text = "Badge Color",
-                style = MaterialTheme.typography.labelMedium
-            )
-            Spacer(modifier = Modifier.height(6.dp))
-
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(SpeakerDiarizer.DEFAULT_BADGE_COLORS) { hex ->
-                    val color = parseHexColor(hex)
-                    val isSelected = hex.equals(selectedColorHex, ignoreCase = true)
-                    Box(
-                        modifier = Modifier
-                            .size(if (isSelected) 34.dp else 28.dp)
-                            .clip(CircleShape)
-                            .background(color)
-                            .clickable { selectedColorHex = hex }
-                    )
-                }
-            }
-
-            if (enrolledProfiles.isNotEmpty()) {
-                Spacer(modifier = Modifier.height(16.dp))
-                Text(
-                    text = "Or Link to an Existing Enrolled Profile:",
-                    style = MaterialTheme.typography.labelMedium
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(enrolledProfiles, key = { it.profileId }) { profile ->
-                        OutlinedButton(
-                            onClick = {
-                                onSaveSpeakerProfile(
-                                    profile.displayName,
-                                    profile.profileId,
-                                    profile.badgeColorHex
-                                )
+        when {
+            activeHere -> {
+                val p = summaryProgress!!
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = if (p.cancelling) "Cancelling summary…" else "${p.stage}…",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold
+                        )
+                        val detail = buildString {
+                            if (p.totalParts > 0) append("${p.completedParts}/${p.totalParts} parts")
+                            if (p.generatedTokens > 0) {
+                                if (isNotEmpty()) append(" · ")
+                                append("${p.generatedTokens} tokens")
                             }
-                        ) {
-                            Text("${profile.displayName} (${profile.sampleCount} clips)")
+                        }
+                        if (detail.isNotEmpty()) {
+                            Text(detail, style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        // Cancellation can take a while while native decode
+                        // unwinds; the button stays disabled meanwhile.
+                        TextButton(onClick = onCancelSummary, enabled = !p.cancelling) {
+                            Text("Cancel Summary", color = MaterialTheme.colorScheme.error)
                         }
                     }
                 }
             }
-
-            Spacer(modifier = Modifier.height(20.dp))
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End
-            ) {
-                TextButton(onClick = onDismiss) {
-                    Text("Cancel")
-                }
-                Spacer(modifier = Modifier.width(8.dp))
-                Button(
-                    onClick = {
-                        val finalName = customName.trim().ifEmpty { segment.speakerLabel }
-                        onSaveSpeakerProfile(finalName, segment.speakerProfileId, selectedColorHex)
-                    },
-                    enabled = customName.isNotBlank() || segment.speakerProfileId != null
-                ) {
-                    Text("Save Profile & Label All Turns")
-                }
+            summaryState == "generating" -> {
+                Text(
+                    "Generating summary…",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
-
-            Spacer(modifier = Modifier.height(16.dp))
         }
-    }
-}
 
-@Composable
-private fun NotesAndSummaryTab(
-    manualNotes: String,
-    aiSummary: String?,
-    onNotesChanged: (String) -> Unit
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
+        // Statuses render even when old summary text exists below.
+        if (!activeHere) {
+            when (summaryState) {
+                "failed" -> Text(
+                    "Summary generation failed or was cancelled. Generate it again.",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.error
+                )
+                "unavailable" -> Text(
+                    "The summary provider is not configured. Set it up in Settings → AI Summaries.",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+
         if (!aiSummary.isNullOrBlank()) {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -1014,11 +811,37 @@ private fun NotesAndSummaryTab(
                         fontWeight = FontWeight.Bold
                     )
                     Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = aiSummary,
-                        style = MaterialTheme.typography.bodyMedium
-                    )
+                    SelectionContainer {
+                        Text(
+                            text = aiSummary,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
                 }
+            }
+        }
+
+        if (meetingPhase == "completed" && transcriptAvailable && !activeHere) {
+            val regenerate = summaryState == "completed" && !aiSummary.isNullOrBlank()
+            Button(
+                onClick = onGenerateSummary,
+                enabled = !recordingBusy && !anotherSummary,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(if (regenerate) "Regenerate Summary" else "Generate Summary")
+            }
+            if (recordingBusy) {
+                Text(
+                    "A recording is still finishing.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else if (anotherSummary) {
+                Text(
+                    com.phequals7.muesli.meetings.MeetingSummaryService.BUSY_MESSAGE,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
 
@@ -1028,7 +851,7 @@ private fun NotesAndSummaryTab(
             label = { Text("Meeting Notes") },
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(1f)
+                .heightIn(min = 160.dp)
         )
     }
 }

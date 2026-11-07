@@ -30,7 +30,7 @@ import com.phequals7.muesli.data.entity.Transcript
         SpeakerProfileEntity::class,
         SpeakerProfileSampleEntity::class
     ],
-    version = 5,
+    version = 7,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -132,8 +132,22 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /** Room v5 → v6: nullable SAF export pointers for the recordings-folder WAV/SRT pair. */
+        private val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE recording_sessions ADD COLUMN exportedWavUri TEXT")
+                db.execSQL("ALTER TABLE recording_sessions ADD COLUMN exportedSrtUri TEXT")
+            }
+        }
+
+        private val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE recording_sessions ADD COLUMN originalTitle TEXT")
+            }
+        }
+
         /** Exposed for migration tests. */
-        internal val MIGRATIONS = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+        internal val MIGRATIONS = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
 
         fun getDatabase(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
@@ -158,8 +172,7 @@ abstract class AppDatabase : RoomDatabase() {
             val db = getDatabase(context)
             return PROFILE_STORE_INSTANCE ?: synchronized(this) {
                 PROFILE_STORE_INSTANCE ?: RoomSpeakerProfileStore(
-                    speakerProfileDao = db.speakerProfileDao(),
-                    transcriptSegmentDao = db.transcriptSegmentDao()
+                    speakerProfileDao = db.speakerProfileDao()
                 ).also { PROFILE_STORE_INSTANCE = it }
             }
         }

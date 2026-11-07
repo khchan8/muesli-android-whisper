@@ -36,16 +36,17 @@ The current release is **v2.0.0-alpha**. Install a sideloadable APK from [GitHub
 
 ## Features
 
-- **Trilingual on-device transcription (v2)** — one model handles English, Thai, Mandarin, and Cantonese with code-switching: Qwen3-ASR 0.6B INT8 (default, ~879 MB), Qwen3-ASR 1.7B INT8 (high-accuracy), Whisper Large-v3-Turbo, or the SenseVoiceSmall + Zipformer-Thai ultra-fast hybrid — all through [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) / ONNX Runtime. Legacy Parakeet models remain available.
+- **On-device transcription** — Qwen3-ASR, Whisper Turbo, SenseVoiceSmall + Zipformer-Thai, and legacy Parakeet models run through [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx). The hybrid routes explicitly selected Thai to Zipformer; Auto routes to SenseVoice and does not detect Thai automatically.
 - **Live dictation waveform** — real-time mic-driven waveform during recording, ported bar-for-bar from the iOS implementation, plus an elapsed-time badge.
 - **Dictation keyboard** — a dictation-only input method: explicitly start/stop recording, apply filler-word removal and custom-dictionary replacements, then insert the final text into the active text field. Includes punctuation, editing controls, key repeat, and the system keyboard picker.
 - **Quick capture (Android-exclusive)** — a draggable floating bubble that lives over other apps: tap to dictate into a compact overlay card; the note is saved and copied to the clipboard. Also available as a Quick Settings tile and a home-screen widget. Enable from **Settings → Voice Notes → Quick Capture**.
 - **Keep mic ready** — optionally prewarm the recognizer when the keyboard opens. Recording starts only when you tap the mic; opening the keyboard never starts capture automatically.
-- **CAM++ speaker diarization & voiceprint profiles (v2)** — a five-stage pipeline (pyannote turn segmentation → ≥1.2s anchor filtering → 3D-Speaker CAM++ embeddings → centroid consolidation → profile matching) replaces the old TitaNet setup that fragmented a 3-speaker meeting into 100+ "speakers". Tap any speaker badge to enroll a named voiceprint; enrolled speakers are recognized automatically in future meetings (threshold 0.60), with a speaker-count hint (Auto/2/3/4/5+) for constrained re-clustering.
+- **Speaker diarization and voice profiles** — pyannote and CAM++ group meeting speech and attempt to match enrolled voiceprints. Open **Settings → Audio Profiles** to record an eight-second sample, test similarity, rename, or delete profiles. Download the CAM++ model in **Settings → Models** first. Matching is probabilistic; review labels before relying on them.
+  Profiles created with the older TitaNet model cannot be distinguished reliably from CAM++ profiles; delete and re-enroll them before using CAM++ matching.
 - **Synchronized playback (v2)** — transcripts are stored as structured blocks (`startMs`/`endMs`/speaker) in Room v5. During playback the active block highlights and auto-scrolls (80ms polling, binary-search lookup, 4s manual-scroll cooldown); tap any block to seek audio to that moment.
-- **Public recordings folder (v2)** — meeting WAVs are written directly to `/sdcard/Recordings/Muesli/` (visible in file managers and over USB/MTP, indexed via MediaScanner) with one-tap migration of legacy internal recordings. On devices where public storage writes are blocked, recording falls back to the previous app-private path.
+- **Recording exports** — retained WAVs and matching SRTs are kept privately and exported to a folder chosen under **Settings → Meetings → Recordings folder**. Choose or create `Recordings/Muesli` when the system picker opens. Editing written notes updates the SRT; notes and completed AI summaries are included as labeled cues after the audio, so anyone with the SRT can read them. If export fails, open the meeting to choose a folder or retry; the private recording remains available.
 - **Meeting recorder** — a foreground service records meetings (with an ongoing notification + stop/discard actions), segments speech with a bundled Silero VAD and decodes each segment on-device for live local transcription, then runs CAM++ diarization when speaker labels are enabled.
-- **AI meeting summaries** — optional ChatGPT sign-in or OpenRouter with your own API key. Generates template-based notes and a meeting title from transcript text; disabled by default.
+- **AI meeting summaries** — generate manually from a meeting's **Summary** tab or enable automatic generation in settings. A generated title is appended to the original meeting title and replaced on regeneration. Providers include on-device Qwen, ChatGPT, OpenRouter, and a custom HTTPS OpenAI-compatible chat-completions endpoint with its own model ID and optional key. Cloud providers receive transcript text and written notes.
 - **Recording microphone picker** — Automatic, Phone, Bluetooth, or USB input preference, with a route label. Bluetooth routing is best-effort and varies by device.
 - **Personal dictionary** — custom words with Jaro-Winkler fuzzy matching, phrase replacements, and filler-word filtering applied to both dictation and meeting transcripts.
 - **Usage stats** — streak, total words, words-per-minute, and meeting counts computed from local history.
@@ -86,7 +87,7 @@ echo "sdk.dir=$HOME/Library/Android/sdk" > local.properties   # macOS example
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-On first launch, onboarding walks you through microphone permission, model selection/download, and a test dictation. You can change models later in **Settings → Models**. Voice notes, keyboard dictation, meeting transcription, and speaker labeling work offline once the selected speech model is downloaded. AI summaries require an internet connection and provider credentials.
+On first launch, onboarding walks you through microphone permission, model selection/download, and a test dictation. You can change models later in **Settings → Models**. Voice notes, keyboard dictation, meeting transcription, speaker labeling, and on-device Qwen summaries work offline once their models are downloaded. Cloud summaries require a network connection and any provider credentials.
 
 Optional: enable the **Muesli Dictation Keyboard** from onboarding or **Settings → Voice Notes → Keyboard setup**, then switch to it from any text field using the system keyboard picker (globe key).
 
@@ -160,12 +161,12 @@ app/src/main/jniLibs/arm64-v8a/            Prebuilt sherpa-onnx + ONNX Runtime n
 
 The meeting pipeline is:
 
-1. `AudioRecord` captures 16 kHz mono float audio and writes a 16-bit PCM WAV directly to `/sdcard/Recordings/Muesli/` (with MediaScanner indexing). When retention is off, a temporary WAV is written to cache and deleted after diarization.
+1. `AudioRecord` captures 16 kHz mono float audio and writes a 16-bit PCM WAV in app-private storage. When retention is off, a temporary WAV is written to cache and deleted after diarization.
 2. Bundled Silero VAD segments speech for sequential on-device decoding (Qwen3-ASR / Whisper Turbo / SenseVoice+Zipformer-Thai / Parakeet), capped at 30 seconds per segment. Fixed 30-second chunks are the fallback if VAD is unavailable; trailing audio is flushed on stop.
 3. Chunk transcripts receive filler-word filtering and custom-dictionary replacements, then appear in the live meeting transcript.
-4. On stop, optional on-device diarization runs against the WAV (pyannote segmentation + 3D-Speaker CAM++ embeddings, with ≥1.2s anchor filtering, centroid consolidation, and persistent speaker-profile matching).
-5. Structured transcript blocks (`meeting_transcript_segments`), flat inline text, and session state are persisted in Room v5.
-6. If AI summaries are enabled and the selected provider has credentials, transcript text is submitted for structured notes and title generation.
+4. On stop, optional on-device diarization runs synchronously against the WAV after releasing the ASR model. If pyannote or CAM++ is unavailable or diarization fails, timestamped single-speaker transcript blocks are retained.
+5. Structured transcript blocks, flat inline text, and session state are persisted in Room. Retained WAV and SRT files are exported as a pair to the user-selected folder.
+6. If automatic AI summaries are enabled, summary generation starts independently of recording finalization. Summaries can also be generated or cancelled from the saved meeting.
 
 ---
 
@@ -176,10 +177,10 @@ The meeting pipeline is:
 | App | Kotlin, Jetpack Compose (Material 3), Room |
 | Keyboard | InputMethodService with Compose-hosted UI |
 | Local ASR | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 1.13.4 — Qwen3-ASR 0.6B/1.7B, Whisper Large-v3-Turbo, SenseVoiceSmall + Zipformer-Thai, Parakeet (int8) via ONNX Runtime |
-| Meeting capture | Foreground service, AudioRecord, `/sdcard/Recordings/Muesli/` WAV output, Silero VAD |
+| Meeting capture | Foreground service, AudioRecord, private WAV and user-selected WAV/SRT export, Silero VAD |
 | Speaker diarization | pyannote segmentation 3.0 + 3D-Speaker CAM++ (with persistent voiceprint profiles) |
-| AI summaries | ChatGPT OAuth + SSE, OpenRouter BYOK, OkHttp |
-| Storage | Room v5 (SQLite) + SharedPreferences |
+| AI summaries | On-device Qwen, ChatGPT OAuth + SSE, OpenRouter and custom HTTPS endpoints |
+| Storage | Room v6 (SQLite) + SharedPreferences |
 | Model delivery | Resumable HuggingFace / mirror downloads + streaming `.tar.bz2` extraction |
 | Build | Gradle 9 (Kotlin DSL), AGP 9, KSP |
 | Tests | JUnit 4, MockWebServer download tests, Room migration instrumentation test |
@@ -248,8 +249,8 @@ Muesli's default design is local-first:
 
 - Speech capture, transcription, and speaker diarization run on device. The system speech recognizer and mock engine have been removed; sherpa-onnx is the only transcription engine.
 - Model downloads use HuggingFace (with a DNS-failure mirror fallback) or GitHub. Core recording and transcription workflows work offline once a model is downloaded.
-- AI summaries are disabled by default. When enabled and configured, transcript text and any included manual notes are sent to the selected ChatGPT or OpenRouter provider. ChatGPT sign-in also uses network requests for authentication and token refresh.
-- Saved text and retained meeting WAVs are stored in app-private storage. Voice-note audio is not retained. Android system backup is currently enabled in the application manifest.
+- AI summaries are disabled by default. When a cloud provider is selected, transcript text and any included manual notes are sent to that provider. On-device Qwen does not upload them.
+- Saved text, speaker profiles and canonical recordings are stored in app-private storage. Retained meeting WAVs and SRTs can be exported to a user-selected folder; voice-note audio is not retained. Android system backup is currently enabled in the application manifest.
 - No Muesli account is required. There is no Muesli-hosted backend, analytics, or crash reporting in the current build. Optional summary-provider credentials are stored in app-private SharedPreferences.
 - Keyboard dictation inserts text into the active field; its transcription does not require uploading audio. Opening the keyboard or enabling keep-mic-ready does not automatically record.
 

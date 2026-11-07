@@ -1,10 +1,6 @@
 package com.phequals7.muesli.data
 
 import com.phequals7.muesli.data.dao.SpeakerProfileDao
-import com.phequals7.muesli.data.dao.TranscriptSegmentDao
-import com.phequals7.muesli.data.entity.MeetingTranscriptSegmentEntity
-import com.phequals7.muesli.data.entity.SpeakerProfileEntity
-import com.phequals7.muesli.data.entity.SpeakerProfileSampleEntity
 import com.phequals7.muesli.meetings.SpeakerEmbeddingSerializer
 import com.phequals7.muesli.meetings.SpeakerProfileRecord
 import com.phequals7.muesli.meetings.SpeakerProfileStore
@@ -15,12 +11,11 @@ import kotlinx.coroutines.withContext
 
 /**
  * Room v5 implementation of [SpeakerProfileStore]: persists speaker
- * voiceprints and re-labels transcript segments when a cluster is enrolled
- * into a named profile.
+ * voiceprints. Transcript-segment relabeling was removed with the
+ * post-meeting enrollment sheet; microphone enrollment stays.
  */
 class RoomSpeakerProfileStore(
-    private val speakerProfileDao: SpeakerProfileDao,
-    private val transcriptSegmentDao: TranscriptSegmentDao
+    private val speakerProfileDao: SpeakerProfileDao
 ) : SpeakerProfileStore {
 
     fun observeProfiles(): Flow<List<SpeakerProfileRecord>> =
@@ -40,46 +35,38 @@ class RoomSpeakerProfileStore(
         sourceSessionId: String?,
         durationMs: Long
     ) = withContext(Dispatchers.IO) {
-        speakerProfileDao.upsertProfile(SpeakerProfileEntity.fromDomainRecord(profile))
-        if (newSampleEmbedding.isNotEmpty()) {
-            speakerProfileDao.insertProfileSample(
-                SpeakerProfileSampleEntity(
-                    profileId = profile.profileId,
-                    sourceSessionId = sourceSessionId,
-                    durationMs = durationMs,
-                    embeddingBlob = SpeakerEmbeddingSerializer.floatArrayToBlob(newSampleEmbedding),
-                    createdAtMs = System.currentTimeMillis()
-                )
+        // Single @Transaction: the profile row is UPDATEd in place (never REPLACEd),
+        // so previously enrolled samples survive every refresh of the centroid.
+        val sample = if (newSampleEmbedding.isNotEmpty()) {
+            com.phequals7.muesli.data.entity.SpeakerProfileSampleEntity(
+                profileId = profile.profileId,
+                sourceSessionId = sourceSessionId,
+                durationMs = durationMs,
+                embeddingBlob = SpeakerEmbeddingSerializer.floatArrayToBlob(newSampleEmbedding),
+                createdAtMs = System.currentTimeMillis()
             )
+        } else {
+            null
         }
+        speakerProfileDao.upsertProfileWithSample(com.phequals7.muesli.data.entity.SpeakerProfileEntity.fromDomainRecord(profile), sample)
     }
 
-    override suspend fun updateSessionClusterProfile(
-        sessionId: String,
-        clusterId: Int,
-        speakerProfileId: String,
-        speakerLabel: String,
-        badgeColorHex: String
-    ) = withContext(Dispatchers.IO) {
-        transcriptSegmentDao.updateClusterSpeakerAttribution(
-            sessionId = sessionId,
-            clusterId = clusterId,
-            speakerProfileId = speakerProfileId,
-            speakerLabel = speakerLabel,
-            badgeColorHex = badgeColorHex
-        )
-
-        // Refresh the flat inline transcript so text exports reflect the new speaker name.
-        val segments = transcriptSegmentDao.getSegmentsForSession(sessionId)
-        if (segments.isNotEmpty()) {
-            transcriptSegmentDao.updateInlineTranscriptText(sessionId, formatInline(segments))
-        }
+    /** Deletes a profile and its samples; labels already written into transcripts stay intact. */
+    suspend fun deleteProfile(profileId: String) = withContext(Dispatchers.IO) {
+        speakerProfileDao.deleteProfile(profileId)
     }
 
-    private fun formatInline(segments: List<MeetingTranscriptSegmentEntity>): String =
-        segments.joinToString("\n\n") { seg ->
-            val mm = (seg.startMs / 1000) / 60
-            val ss = (seg.startMs / 1000) % 60
-            String.format("[%02d:%02d] %s: %s", mm, ss, seg.speakerLabel, seg.text)
+    /** Renames in place; false when the profile no longer exists. */
+    suspend fun renameProfile(profileId: String, newDisplayName: String): Boolean = withContext(Dispatchers.IO) {
+        val trimmed = newDisplayName.trim()
+        val existing = speakerProfileDao.getProfileById(profileId)
+        if (existing == null || trimmed.isEmpty()) {
+            false
+        } else {
+            speakerProfileDao.upsertProfile(
+                existing.copy(displayName = trimmed, updatedAtMs = System.currentTimeMillis())
+            )
+            true
         }
+    }
 }

@@ -341,7 +341,7 @@ class ModelManager(private val context: Context) {
         for ((index, remoteFile) in manifest.files.withIndex()) {
             coroutineContext.ensureActive()
             val finalFile = File(baseTargetDir, remoteFile.relativeDestinationPath)
-            if (finalFile.exists() && finalFile.length() >= remoteFile.expectedMinBytes) {
+            if (finalFile.exists() && isInstalledFileValid(finalFile, remoteFile)) {
                 continue
             }
             finalFile.parentFile?.mkdirs()
@@ -365,12 +365,59 @@ class ModelManager(private val context: Context) {
                 }
             )
 
+            // Verify the downloaded .part before touching any previously installed file.
+            try {
+                verifyDownloadedPart(partFile, remoteFile)
+            } catch (e: IOException) {
+                partFile.delete()
+                throw e
+            }
+
             if (finalFile.exists()) finalFile.delete()
             if (!partFile.renameTo(finalFile)) {
                 partFile.copyTo(finalFile, overwrite = true)
                 partFile.delete()
             }
         }
+    }
+
+    private fun isInstalledFileValid(file: File, remote: RemoteModelFile): Boolean {
+        if (file.length() < remote.expectedMinBytes) return false
+        if (remote.expectedBytes != null && file.length() != remote.expectedBytes) return false
+        if (remote.relativeDestinationPath.endsWith(".gguf", ignoreCase = true) && !hasGgufMagic(file)) return false
+        return true
+    }
+
+    private fun verifyDownloadedPart(partFile: File, remote: RemoteModelFile) {
+        if (remote.expectedBytes != null && partFile.length() != remote.expectedBytes) {
+            throw IOException(
+                "Downloaded ${remote.relativeDestinationPath} size mismatch " +
+                    "(${partFile.length()} of ${remote.expectedBytes} bytes)"
+            )
+        }
+        if (remote.relativeDestinationPath.endsWith(".gguf", ignoreCase = true) && !hasGgufMagic(partFile)) {
+            throw IOException("Downloaded ${remote.relativeDestinationPath} is not a valid GGUF file")
+        }
+        val expectedSha = remote.sha256
+        if (expectedSha != null) {
+            val actualSha = computeSha256Hex(partFile)
+            if (!actualSha.equals(expectedSha, ignoreCase = true)) {
+                throw IOException("Checksum mismatch for ${remote.relativeDestinationPath}")
+            }
+        }
+    }
+
+    private fun computeSha256Hex(file: File): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        val buf = ByteArray(BUFFER_SIZE)
+        file.inputStream().use { input ->
+            while (true) {
+                val read = input.read(buf)
+                if (read < 0) break
+                if (read > 0) digest.update(buf, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     /**

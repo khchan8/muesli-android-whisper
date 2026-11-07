@@ -26,5 +26,11 @@ data class RecordingSession(
     /** AI-generated structured notes (or failure notes when generation fails). */
     val summaryText: String = "",
     /** "notStarted", "generating", "completed", "failed", "unavailable". */
-    val summaryState: String = "notStarted"
+    val summaryState: String = "notStarted",
+    /** SAF document URI of the exported WAV in the user-chosen recordings folder (Room v6). */
+    val exportedWavUri: String? = null,
+    /** SAF document URI of the exported SRT beside the WAV (Room v6). */
+    val exportedSrtUri: String? = null,
+    /** Original title before the first AI-generated title, if one was added. */
+    val originalTitle: String? = null
 )

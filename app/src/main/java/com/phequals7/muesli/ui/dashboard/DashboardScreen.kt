@@ -17,6 +17,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -47,13 +48,16 @@ fun DashboardScreen(
     val colors = MuesliTheme.colors
 
     var activeTab by remember { mutableStateOf(DashboardTab.DICTATIONS) }
+    val keyboardVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
 
     Scaffold(
         bottomBar = {
-            MuesliBottomNav(
-                activeTab = activeTab,
-                onTabSelected = { activeTab = it }
-            )
+            if (!keyboardVisible) {
+                MuesliBottomNav(
+                    activeTab = activeTab,
+                    onTabSelected = { activeTab = it }
+                )
+            }
         },
         containerColor = colors.backgroundDeep,
         modifier = modifier.fillMaxSize()
@@ -62,6 +66,7 @@ fun DashboardScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
+                .consumeWindowInsets(innerPadding)
         ) {
             when (activeTab) {
                 DashboardTab.DICTATIONS -> VoiceNotesTab(

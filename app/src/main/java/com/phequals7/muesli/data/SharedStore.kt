@@ -33,14 +33,19 @@ class SharedStore(private val context: Context) {
         private const val KEY_DEFAULT_MEETING_TEMPLATE = "default_meeting_template"
         private const val KEY_RETAIN_MEETING_AUDIO = "retain_meeting_audio"
         private const val KEY_SUMMARIES_ENABLED = "summaries_enabled"
-        private const val KEY_SUMMARY_BACKEND = "summary_backend" // "chatgpt" (primary) or "openrouter"
+        private const val KEY_SUMMARY_BACKEND = "summary_backend" // "chatgpt", "openrouter", or "local_qwen"
         private const val KEY_CHATGPT_MODEL = "chatgpt_model"
         private const val KEY_OPENROUTER_MODEL = "openrouter_model"
         private const val KEY_OPENROUTER_API_KEY = "openrouter_api_key"
+        private const val KEY_LOCAL_SUMMARY_MODEL_ID = "local_summary_model_id"
         private const val KEY_SELECTED_MODEL_ID = "selected_model_id"
         private const val KEY_SPEAKER_LABELS = "speaker_labels"
         private const val KEY_BUBBLE_ENABLED = "bubble_enabled"
         private const val KEY_MIC_PREFERENCE = "mic_preference" // "auto", "phone", "bluetooth", "usb"
+        private const val KEY_CUSTOM_SUMMARY_URL = "custom_summary_url"
+        private const val KEY_CUSTOM_SUMMARY_API_KEY = "custom_summary_api_key"
+        private const val KEY_CUSTOM_SUMMARY_MODEL = "custom_summary_model"
+        private const val KEY_RECORDINGS_TREE_URI = "recordings_tree_uri"
         private const val KEY_LANGUAGE_HINT = "language_hint" // "auto", "en", "th", "zh", "yue"
     }
 
@@ -102,7 +107,7 @@ class SharedStore(private val context: Context) {
         get() = prefs.getBoolean(KEY_SUMMARIES_ENABLED, false)
         set(value) = prefs.edit().putBoolean(KEY_SUMMARIES_ENABLED, value).apply()
 
-    /** Summary backend: "chatgpt" (primary, WHAM) or "openrouter" (BYOK). */
+    /** Summary backend: "chatgpt" (primary, WHAM), "openrouter" (BYOK), or "local_qwen" (on-device GGUF). */
     var summaryBackend: String
         get() = prefs.getString(KEY_SUMMARY_BACKEND, "chatgpt") ?: "chatgpt"
         set(value) = prefs.edit().putString(KEY_SUMMARY_BACKEND, value).apply()
@@ -119,6 +124,29 @@ class SharedStore(private val context: Context) {
         get() = prefs.getString(KEY_OPENROUTER_API_KEY, "") ?: ""
         set(value) = prefs.edit().putString(KEY_OPENROUTER_API_KEY, value).apply()
 
+    /** Selected on-device Qwen3 GGUF summary model (defaults to 1.7B Q4_K_M). */
+    var localSummaryModelId: String
+        get() = prefs.getString(KEY_LOCAL_SUMMARY_MODEL_ID, "qwen3-summary-1.7b-q4-k-m") ?: "qwen3-summary-1.7b-q4-k-m"
+        set(value) = prefs.edit().putString(KEY_LOCAL_SUMMARY_MODEL_ID, value).apply()
+    /** Custom OpenAI-compatible backend: full HTTPS chat-completions endpoint. */
+    var customSummaryUrl: String
+        get() = prefs.getString(KEY_CUSTOM_SUMMARY_URL, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_CUSTOM_SUMMARY_URL, value).apply()
+
+    /** Bearer key for the custom endpoint; blank = unauthenticated endpoint. */
+    var customSummaryApiKey: String
+        get() = prefs.getString(KEY_CUSTOM_SUMMARY_API_KEY, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_CUSTOM_SUMMARY_API_KEY, value).apply()
+
+    /** Model id sent to the custom endpoint (required). */
+    var customSummaryModel: String
+        get() = prefs.getString(KEY_CUSTOM_SUMMARY_MODEL, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_CUSTOM_SUMMARY_MODEL, value).apply()
+
+    /** SAF tree URI of the user-chosen recordings export folder; blank = not chosen. */
+    var recordingsTreeUri: String
+        get() = prefs.getString(KEY_RECORDINGS_TREE_URI, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_RECORDINGS_TREE_URI, value).apply()
     var userProfileName: String
         get() = prefs.getString(KEY_USER_PROFILE_NAME, "") ?: ""
         set(value) = prefs.edit().putString(KEY_USER_PROFILE_NAME, value).apply()
@@ -173,6 +201,22 @@ class SharedStore(private val context: Context) {
     suspend fun updateRecordingSession(session: RecordingSession) = recordingSessionDao.updateSession(session)
     suspend fun deleteRecordingSession(session: RecordingSession) = recordingSessionDao.deleteSession(session)
 
+    // Field-scoped meeting updates (see RecordingSessionDao for rationale)
+    suspend fun updateMeetingNotes(sessionId: String, notes: String): Int =
+        recordingSessionDao.updateMeetingNotes(sessionId, notes)
+
+    suspend fun updateRecordingAudioPath(sessionId: String, expectedOldPath: String?, newPath: String): Int =
+        recordingSessionDao.updateAudioPath(sessionId, expectedOldPath, newPath)
+
+    suspend fun updateMeetingSummaryState(sessionId: String, state: String): Int =
+        recordingSessionDao.updateSummaryState(sessionId, state)
+
+    suspend fun updateMeetingSummary(sessionId: String, text: String, state: String, title: String): Int =
+        recordingSessionDao.updateSummary(sessionId, text, state, title)
+
+    suspend fun updateRecordingExportError(sessionId: String, message: String?): Int =
+        recordingSessionDao.updateExportError(sessionId, message)
+
     // Transcripts
     fun getTranscriptForSessionFlow(sessionId: String): Flow<Transcript?> = transcriptDao.getTranscriptForSessionFlow(sessionId)
     suspend fun getTranscriptForSession(sessionId: String): Transcript? = transcriptDao.getTranscriptForSession(sessionId)
@@ -188,4 +232,14 @@ class SharedStore(private val context: Context) {
 
     suspend fun replaceTranscriptSegments(sessionId: String, segments: List<MeetingTranscriptSegmentEntity>, inlineText: String) =
         transcriptSegmentDao.replaceSegmentsForSession(sessionId, segments, inlineText)
+
+    suspend fun updateRecordingExportUris(
+        sessionId: String,
+        expectedAudioPath: String?,
+        wavUri: String,
+        srtUri: String
+    ): Int = recordingSessionDao.updateRecordingExportUris(sessionId, expectedAudioPath, wavUri, srtUri)
+
+    suspend fun getSessionsWithGeneratingSummary(): List<com.phequals7.muesli.data.dao.SummaryGeneratingRow> =
+        recordingSessionDao.getSessionsWithGeneratingSummary()
 }

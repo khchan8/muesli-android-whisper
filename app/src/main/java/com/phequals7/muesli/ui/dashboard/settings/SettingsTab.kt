@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.provider.Settings
+import com.phequals7.muesli.ui.dashboard.meetings.SpeakerProfilesScreen
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -30,6 +31,8 @@ import com.phequals7.muesli.audio.AudioInputRouteManager
 import com.phequals7.muesli.data.SharedStore
 import com.phequals7.muesli.data.entity.CustomWord
 import com.phequals7.muesli.meetings.MeetingTemplate
+import com.phequals7.muesli.meetings.RecordingExportAccess
+import com.phequals7.muesli.meetings.rememberRecordingsFolderPicker
 import com.phequals7.muesli.model.ModelManager
 import com.phequals7.muesli.bubble.BubbleService
 import com.phequals7.muesli.model.SpeechModelSpec
@@ -58,6 +61,7 @@ fun SettingsTab(store: SharedStore) {
         SettingsSection.VOICE_NOTES -> SettingsScaffold("Voice Notes", onBack = { section = null }) {
             VoiceNotesSettings(store)
         }
+        SettingsSection.SPEAKER_PROFILES -> SpeakerProfilesScreen(onBack = { section = null })
         SettingsSection.MEETINGS -> SettingsScaffold("Meetings", onBack = { section = null }) {
             MeetingsSettings(store)
         }
@@ -86,6 +90,7 @@ private enum class SettingsSection(
 ) {
     VOICE_NOTES("Voice Notes", "Speech engine, mic readiness, and keyboard setup.", Icons.Default.Keyboard),
     MEETINGS("Meetings", "Default template and audio retention.", Icons.Default.Groups),
+    SPEAKER_PROFILES("Audio Profiles", "Enroll speaker voiceprints and test voice matching.", Icons.Default.RecordVoiceOver),
     DICTIONARY("Dictionary", "Filler word removal, custom phrases, names, and acronyms.", Icons.Default.Book),
     MODELS("Models", "Choose and download on-device Parakeet models.", Icons.Default.Memory),
     AI_SUMMARIES("AI Summaries", "Meeting summary providers, auth, and model selection.", Icons.Default.AutoAwesome),
@@ -337,10 +342,17 @@ private fun VoiceNotesSettings(store: SharedStore) {
 
 @Composable
 private fun MeetingsSettings(store: SharedStore) {
+    val context = LocalContext.current
     val colors = MuesliTheme.colors
     var defaultTemplate by remember { mutableStateOf(MeetingTemplate.fromId(store.defaultMeetingTemplate)) }
     var retainAudio by remember { mutableStateOf(store.retainMeetingAudio) }
     var speakerLabels by remember { mutableStateOf(store.speakerLabelsEnabled) }
+    var folderError by remember { mutableStateOf<String?>(null) }
+    var folderRevision by remember { mutableIntStateOf(0) }
+    val chooseFolder = rememberRecordingsFolderPicker(store, onSelected = { folderRevision++ }) { folderError = it }
+    val folderLabel = remember(folderRevision, store.recordingsTreeUri) {
+        RecordingExportAccess.describeFolder(context, store.recordingsTreeUri)
+    }
 
     Column(verticalArrangement = Arrangement.spacedBy(MuesliSpacing.s16)) {
         SettingsCard {
@@ -372,6 +384,26 @@ private fun MeetingsSettings(store: SharedStore) {
                 checked = retainAudio,
                 onCheckedChange = { retainAudio = it; store.retainMeetingAudio = it }
             )
+
+            Text("Recordings folder", color = colors.textPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+            Text(
+                folderLabel?.let { "WAV and SRT files are exported to $it." }
+                    ?: "Pick a folder once so finished meetings export their WAV and SRT files there. Until then they stay inside the app.",
+                color = colors.textSecondary,
+                fontSize = 11.sp,
+                lineHeight = 15.sp
+            )
+            folderError?.let {
+                Text(it, color = colors.destructive, fontSize = 11.sp)
+            }
+            Button(
+                onClick = { folderError = null; chooseFolder() },
+                colors = ButtonDefaults.buttonColors(containerColor = colors.accent),
+                shape = RoundedCornerShape(MuesliCorners.medium),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+            ) {
+                Text(if (folderLabel != null) "Change folder" else "Choose recordings folder", fontSize = 12.sp)
+            }
         }
     }
 }
@@ -524,6 +556,7 @@ private fun micPreferenceSubtitle(
 private fun ModelsSettings(store: SharedStore) {
     val colors = MuesliTheme.colors
     var selectedId by remember { mutableStateOf(SpeechModels.byId(store.selectedModelId).id) }
+    var selectedSummaryId by remember { mutableStateOf(SpeechModels.summaryById(store.localSummaryModelId).id) }
 
     Column(verticalArrangement = Arrangement.spacedBy(MuesliSpacing.s16)) {
         Text(
@@ -554,10 +587,28 @@ private fun ModelsSettings(store: SharedStore) {
             SpeechModelCard(model = model, selected = false, onSelect = {})
         }
 
+        Text(
+            "Summary Models (on-device Qwen3 GGUF)",
+            color = colors.textSecondary,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        SpeechModels.summaryModels.forEach { model ->
+            SpeechModelCard(
+                model = model,
+                selected = model.id == selectedSummaryId,
+                selectable = true,
+                onSelect = {
+                    selectedSummaryId = model.id
+                    store.localSummaryModelId = model.id
+                },
+            )
+        }
+
         SettingsCard {
             Text("About on-device models", color = colors.textPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
             Text(
-                "All models run fully on-device via sherpa-onnx — audio never leaves this phone. The selected model is used for voice notes, the keyboard, and meetings. Legacy Parakeet models are European/English-only.",
+                "All models run fully on-device — audio and transcripts never leave this phone when on-device models are selected. The speech model is used for voice notes, the keyboard, and meetings. Legacy Parakeet models are European/English-only.",
                 color = colors.textSecondary,
                 fontSize = 12.sp,
                 lineHeight = 17.sp
@@ -579,6 +630,7 @@ private fun AiSummariesSettings(store: SharedStore) {
     var backend by remember { mutableStateOf(store.summaryBackend) }
     var chatGptModel by remember { mutableStateOf(store.chatGptModel) }
     var openRouterModel by remember { mutableStateOf(store.openRouterModel) }
+    var localSummaryModelId by remember { mutableStateOf(SpeechModels.summaryById(store.localSummaryModelId).id) }
     var apiKeyInput by remember { mutableStateOf(store.openRouterApiKey) }
     var isSignedIn by remember { mutableStateOf(authManager.isAuthenticated) }
     var signInInProgress by remember { mutableStateOf(false) }
@@ -588,7 +640,7 @@ private fun AiSummariesSettings(store: SharedStore) {
         SettingsCard {
             ToggleRow(
                 title = "Meeting Summaries",
-                subtitle = "Structured notes after local transcription. Transcript text is sent to the selected provider only when this is on.",
+                subtitle = "Structured notes after local transcription. Cloud providers receive transcript text only when selected; On-device Qwen never sends transcript or audio off the device.",
                 checked = summariesEnabled,
                 onCheckedChange = {
                     summariesEnabled = it
@@ -611,8 +663,19 @@ private fun AiSummariesSettings(store: SharedStore) {
                 selected = backend == "openrouter",
                 onClick = { backend = "openrouter"; store.summaryBackend = "openrouter" }
             )
+            ChoiceRow(
+                title = "Custom (OpenAI-compatible)",
+                subtitle = "Your own HTTPS chat-completions endpoint, model, and optional key",
+                selected = backend == "custom",
+                onClick = { backend = "custom"; store.summaryBackend = "custom" }
+            )
+            ChoiceRow(
+                title = "On-device Qwen",
+                subtitle = "Run Qwen3 1.7B (~1.1 GB) or 4B (~2.5 GB) locally inside Muesli",
+                selected = backend == "local_qwen",
+                onClick = { backend = "local_qwen"; store.summaryBackend = "local_qwen" }
+            )
         }
-
         if (backend == "chatgpt") {
             SettingsCard {
                 Text("ChatGPT Account", color = colors.textPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
@@ -688,7 +751,7 @@ private fun AiSummariesSettings(store: SharedStore) {
                     )
                 }
             }
-        } else {
+        } else if (backend == "openrouter") {
             SettingsCard {
                 Text("OpenRouter API Key", color = colors.textPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
                 OutlinedTextField(
@@ -719,6 +782,82 @@ private fun AiSummariesSettings(store: SharedStore) {
                         onClick = { openRouterModel = preset; store.openRouterModel = preset }
                     )
                 }
+            }
+        } else if (backend == "custom") {
+            var customUrl by remember { mutableStateOf(store.customSummaryUrl) }
+            var customKey by remember { mutableStateOf(store.customSummaryApiKey) }
+            var customModel by remember { mutableStateOf(store.customSummaryModel) }
+
+            SettingsCard {
+                Text("Custom Endpoint", color = colors.textPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                OutlinedTextField(
+                    value = customUrl,
+                    onValueChange = {
+                        customUrl = it
+                        store.customSummaryUrl = it.trim()
+                    },
+                    label = { Text("Chat-completions URL") },
+                    placeholder = { Text("https://host.example/v1/chat/completions") },
+                    singleLine = true,
+                    isError = customUrl.isNotBlank() && com.phequals7.muesli.summaries.SummaryHttp.customEndpointError(customUrl, customModel) != null,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = customModel,
+                    onValueChange = {
+                        customModel = it
+                        store.customSummaryModel = it.trim()
+                    },
+                    label = { Text("Model ID") },
+                    placeholder = { Text("e.g. qwen3-8b-instruct") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = customKey,
+                    onValueChange = {
+                        customKey = it
+                        store.customSummaryApiKey = it.trim()
+                    },
+                    label = { Text("API key (optional)") },
+                    placeholder = { Text("sk-...") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                val validation = com.phequals7.muesli.summaries.SummaryHttp.customEndpointError(customUrl, customModel)
+                Text(
+                    validation ?: "The full endpoint URL is used exactly as entered — Muesli never appends a path. " +
+                        "The API key is stored on this device only.",
+                    color = if (validation != null) colors.destructive else colors.textSecondary,
+                    fontSize = 11.sp
+                )
+                Text(
+                    "Notice: when this backend is selected, your transcript and written notes are uploaded to this endpoint.",
+                    color = colors.textSecondary,
+                    fontSize = 11.sp
+                )
+            }
+        } else if (backend == "local_qwen") {
+            SettingsCard {
+                Text("On-device Qwen", color = colors.textPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                Text(
+                    "Downloads are ~1.1 GB (1.7B, default) or ~2.5 GB (4B). Local summaries run inside Muesli and do not send transcript or audio off this device.",
+                    color = colors.textSecondary,
+                    fontSize = 12.sp,
+                    lineHeight = 17.sp
+                )
+            }
+            SpeechModels.summaryModels.forEach { model ->
+                SpeechModelCard(
+                    model = model,
+                    selected = model.id == localSummaryModelId,
+                    selectable = true,
+                    onSelect = {
+                        localSummaryModelId = model.id
+                        store.localSummaryModelId = model.id
+                    },
+                )
             }
         }
     }
@@ -845,6 +984,7 @@ internal fun SpeechModelCard(
     model: SpeechModelSpec,
     selected: Boolean,
     onSelect: () -> Unit,
+    selectable: Boolean = model.asrModelType != null,
 ) {
     val colors = MuesliTheme.colors
     val context = LocalContext.current
@@ -940,7 +1080,7 @@ internal fun SpeechModelCard(
                         Text("Download", fontSize = 13.sp)
                     }
                 } else {
-                    if (model.asrModelType != null) {
+                    if (selectable) {
                         if (!selected) {
                             Button(
                                 onClick = onSelect,

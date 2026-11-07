@@ -11,6 +11,7 @@ import com.k2fsa.sherpa.onnx.OfflineSpeakerSegmentationPyannoteModelConfig
 import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractor
 import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractorConfig
 import com.k2fsa.sherpa.onnx.SpeakerEmbeddingManager
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -70,19 +71,21 @@ data class SpeakerProfileRecord(
 )
 
 /**
+ * A scored identification result: cosine similarity in [-1, 1] between the
+ * L2-normalized query embedding and an enrolled profile centroid.
+ */
+data class SpeakerProfileMatch(
+    val profile: SpeakerProfileRecord,
+    val similarity: Float
+)
+
+/**
  * Storage contract bridging `SpeakerDiarizer` with Room v5 `speaker_profiles` & `speaker_profile_samples`.
  */
 interface SpeakerProfileStore {
     suspend fun getAllProfiles(): List<SpeakerProfileRecord>
     suspend fun getProfileById(profileId: String): SpeakerProfileRecord?
     suspend fun upsertProfile(profile: SpeakerProfileRecord, newSampleEmbedding: FloatArray, sourceSessionId: String?, durationMs: Long)
-    suspend fun updateSessionClusterProfile(
-        sessionId: String,
-        clusterId: Int,
-        speakerProfileId: String,
-        speakerLabel: String,
-        badgeColorHex: String
-    )
 }
 
 /**
@@ -142,7 +145,8 @@ class SpeakerDiarizer(
         private const val PYANNOTE_INT8_ASSET = "sherpa-onnx-pyannote-segmentation-3-0/model.int8.onnx"
         private const val BUNDLED_PYANNOTE_ASSET = "models/pyannote_segmentation_3_0.int8.onnx"
         private const val CAMPLUS_ZH_EN_ASSET = "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
-        private const val LEGACY_TITANET_ASSET = "models/nemo_en_titanet_small.onnx"
+        private const val PYANNOTE_FP32_ASSET = "sherpa-onnx-pyannote-segmentation-3-0/model.onnx"
+        private const val MIN_ENROLLMENT_SECONDS = 6
 
         // Diarization hyper-parameters tuned for CAM++ (EN + TH + ZH)
         private const val DEFAULT_CLUSTER_DISTANCE_THRESHOLD = 0.68f
@@ -233,8 +237,16 @@ class SpeakerDiarizer(
         maxAutoSpeakers: Int = DEFAULT_MAX_AUTO_SPEAKERS,
         onProgress: ((Float) -> Unit)? = null
     ): List<DiarizationTurn> = withContext(Dispatchers.Default) {
-        val segmentationPath = resolveModelFile(PYANNOTE_INT8_ASSET, BUNDLED_PYANNOTE_ASSET)
-        val embeddingPath = resolveModelFile(CAMPLUS_ZH_EN_ASSET, LEGACY_TITANET_ASSET)
+        // v2.1 Root Cause C: an unverified model path aborts in native
+        // `require(ptr != 0L)`, so resolve via recursive files/+assets/ scan
+        // and degrade to the timestamped single-speaker fallback on absence.
+        val segmentationPath = resolveVerifiedModelFile(PYANNOTE_INT8_ASSET, PYANNOTE_FP32_ASSET, BUNDLED_PYANNOTE_ASSET)
+        val embeddingPath = resolveVerifiedModelFile(CAMPLUS_ZH_EN_ASSET)
+        if (segmentationPath == null || embeddingPath == null) {
+            warn("Diarization models unavailable (segmentation=${segmentationPath != null}, embedding=${embeddingPath != null}); falling back to timestamped single-speaker segments")
+            return@withContext emptyList<DiarizationTurn>()
+        }
+        onProgress?.invoke(0.05f)
 
         val extractorConfig = SpeakerEmbeddingExtractorConfig(
             model = embeddingPath,
@@ -243,30 +255,63 @@ class SpeakerDiarizer(
             provider = "cpu"
         )
 
-        val sdConfig = OfflineSpeakerDiarizationConfig(
-            segmentation = OfflineSpeakerSegmentationModelConfig(
-                pyannote = OfflineSpeakerSegmentationPyannoteModelConfig(model = segmentationPath),
-                numThreads = 4,
-                debug = false,
-                provider = "cpu"
-            ),
-            embedding = extractorConfig,
-            clustering = FastClusteringConfig(
-                numClusters = if (expectedSpeakerCount > 0) expectedSpeakerCount else -1,
-                threshold = clusterDistanceThreshold
-            ),
-            minDurationOn = 0.45f,
-            minDurationOff = 0.45f
-        )
-
-        val diarizer = OfflineSpeakerDiarization(config = sdConfig)
-        val extractor = SpeakerEmbeddingExtractor(config = extractorConfig)
-        val embeddingDim = extractor.dim()
-        val embeddingManager = SpeakerEmbeddingManager(embeddingDim)
-
+        // v2.1 Root Cause B: OfflineSpeakerDiarization loads its own internal
+        // CAM++ copy; run it to completion and release it BEFORE the standalone
+        // SpeakerEmbeddingExtractor (a second CAM++ copy) is instantiated.
+        val mergedSegments: List<OfflineSpeakerDiarizationSegment>
         try {
+            val diarizer = OfflineSpeakerDiarization(
+                config = OfflineSpeakerDiarizationConfig(
+                    segmentation = OfflineSpeakerSegmentationModelConfig(
+                        pyannote = OfflineSpeakerSegmentationPyannoteModelConfig(model = segmentationPath),
+                        numThreads = 4,
+                        debug = false,
+                        provider = "cpu"
+                    ),
+                    embedding = extractorConfig,
+                    clustering = FastClusteringConfig(
+                        numClusters = if (expectedSpeakerCount > 0) expectedSpeakerCount else -1,
+                        threshold = clusterDistanceThreshold
+                    ),
+                    minDurationOn = 0.45f,
+                    minDurationOff = 0.45f
+                )
+            )
+            try {
+                // v2.1 Root Cause A: synchronous process() only — the JNI
+                // callback path runs on an unattached native worker thread
+                // (SIGABRT) or throws UnsatisfiedLinkError (an Error).
+                val rawSegments = diarizer.process(samples16kMono)
+                mergedSegments = mergeMicroGaps(
+                    rawSegments.toList().sortedBy { it.start },
+                    MAX_MICRO_GAP_MERGE_SEC
+                )
+            } finally {
+                try {
+                    diarizer.release()
+                } catch (t: Throwable) {
+                    warn("Diarizer release failed: ${t.message}")
+                }
+            }
+        } catch (t: Throwable) {
+            if (t is CancellationException) throw t
+            warn("Diarization failed (${t.javaClass.simpleName}: ${t.message}); falling back to timestamped single-speaker segments")
+            return@withContext emptyList()
+        }
+
+        if (mergedSegments.isEmpty()) return@withContext emptyList()
+        onProgress?.invoke(0.6f)
+
+        var extractor: SpeakerEmbeddingExtractor? = null
+        var embeddingManager: SpeakerEmbeddingManager? = null
+        try {
+            extractor = SpeakerEmbeddingExtractor(config = extractorConfig)
+            val embeddingDim = extractor.dim()
+            embeddingManager = SpeakerEmbeddingManager(embeddingDim)
+
             // Load enrolled speaker profiles into SpeakerEmbeddingManager
             val enrolledProfiles = profileStore?.getAllProfiles().orEmpty()
+            warnOnModelFamilyMismatch(enrolledProfiles, embeddingDim)
             val profileMapById = enrolledProfiles.associateBy { it.profileId }
             for (profile in enrolledProfiles) {
                 if (profile.centroidVector.size == embeddingDim) {
@@ -274,25 +319,6 @@ class SpeakerDiarizer(
                 }
             }
 
-            // Stage 1: Run Pyannote + CAM++ diarization and merge micro-gaps (< 400ms)
-            val rawSegmentsArray = if (onProgress != null) {
-                diarizer.processWithCallback(
-                    samples = samples16kMono,
-                    callback = { numProcessed, numTotal, _ ->
-                        if (numTotal > 0) {
-                            onProgress((numProcessed.toFloat() / numTotal.toFloat()).coerceIn(0f, 1f))
-                        }
-                        0 // Return 0 to continue processing
-                    }
-                )
-            } else {
-                diarizer.process(samples16kMono)
-            }
-
-            val rawSegments = rawSegmentsArray.toList().sortedBy { it.start }
-            if (rawSegments.isEmpty()) return@withContext emptyList()
-
-            val mergedSegments = mergeMicroGaps(rawSegments, MAX_MICRO_GAP_MERGE_SEC)
 
             // Stage 2 & 3: Separate Anchor Turns (>= 1.2s) from Short Turns (< 1.2s) and extract cluster centroids
             val groupedByRawSpeaker = mergedSegments.groupBy { it.speaker }
@@ -430,33 +456,149 @@ class SpeakerDiarizer(
                 )
             }
 
+            onProgress?.invoke(1f)
             return@withContext mergeAdjacentConsolidatedTurns(preliminaryTurns, maxGapMs = 600L)
+        } catch (t: Throwable) {
+            if (t is CancellationException) throw t
+            warn("Speaker centroid extraction failed (${t.javaClass.simpleName}: ${t.message}); keeping anonymous speaker turns")
+            return@withContext anonymousTurnsFromSegments(mergedSegments)
         } finally {
-            embeddingManager.release()
-            extractor.release()
-            diarizer.release()
+            try {
+                embeddingManager?.release()
+            } catch (t: Throwable) {
+                warn("Embedding manager release failed: ${t.message}")
+            }
+            try {
+                extractor?.release()
+            } catch (t: Throwable) {
+                warn("Extractor release failed: ${t.message}")
+            }
         }
     }
 
     /**
-     * Enrolls a new speaker profile or updates an existing profile using the 192-dim CAM++ cluster centroid
-     * from a meeting transcript block, then updates all matching segments in the session.
+     * Enrolls a new speaker profile or extends an existing one from a raw
+     * >= 6 s 16 kHz mono enrollment clip (SpeakerProfilesScreen live path).
+     *
+     * Fails fast — never a silent no-op: [IllegalArgumentException] for clips
+     * shorter than [MIN_ENROLLMENT_SECONDS], [IllegalStateException] when the
+     * CAM++ model is unavailable, the extracted vector fails validation, or
+     * the existing profile belongs to a different speaker model family.
      */
-    suspend fun enrollOrUpdateSpeakerProfile(
-        sessionId: String,
-        clusterId: Int,
-        clusterCentroid: FloatArray,
+    suspend fun enrollSpeakerFromAudioSamples(
+        samples16kMono: FloatArray,
         displayName: String,
-        existingProfileId: String? = null,
-        badgeColorHex: String? = null,
-        sampleDurationMs: Long = 4000L
-    ): SpeakerProfileRecord = withContext(Dispatchers.IO) {
-        val normalizedSample = SpeakerEmbeddingSerializer.l2Normalize(clusterCentroid)
-        val now = System.currentTimeMillis()
-        val store = profileStore
+        existingProfileId: String? = null
+    ): SpeakerProfileRecord {
+        require(samples16kMono.size >= MIN_ENROLLMENT_SECONDS * SAMPLE_RATE) {
+            "Voice enrollment needs at least $MIN_ENROLLMENT_SECONDS seconds of audio"
+        }
+        return withContext(Dispatchers.IO) {
+            val embedding = extractValidatedEmbedding(samples16kMono)
+            persistEnrollment(
+                normalizedSample = embedding,
+                displayName = displayName,
+                existingProfileId = existingProfileId,
+                badgeColorHex = null,
+                sourceSessionId = null,
+                durationMs = samples16kMono.size * 1000L / SAMPLE_RATE
+            )
+        }
+    }
 
-        val existing = existingProfileId?.let { store?.getProfileById(it) }
-        val updatedProfile = if (existing != null && existing.centroidVector.size == normalizedSample.size) {
+    /**
+     * Identifies the speakers of a raw 16 kHz mono clip against every enrolled
+     * profile, best match first. [SpeakerProfileMatch.similarity] is the cosine
+     * between the L2-normalized query embedding and the profile centroid
+     * (-1..1). Returns an empty list when no embedding can be extracted or no
+     * compatible profile exists; throws [IllegalStateException] only when the
+     * embedding model itself is unavailable.
+     */
+    suspend fun identifySpeakerFromAudioSamples(samples16kMono: FloatArray): List<SpeakerProfileMatch> =
+        withContext(Dispatchers.IO) {
+            val profiles = profileStore?.getAllProfiles().orEmpty()
+            if (profiles.isEmpty()) return@withContext emptyList<SpeakerProfileMatch>()
+
+            val embeddingPath = resolveVerifiedEmbeddingModelPath()
+            val query = withExtractor(embeddingPath) { extractor ->
+                extractNormalizedEmbedding(extractor, samples16kMono)
+            } ?: return@withContext emptyList()
+
+            warnOnModelFamilyMismatch(profiles, query.size)
+            profiles
+                .filter { it.centroidVector.size == query.size }
+                .map { profile ->
+                    SpeakerProfileMatch(
+                        profile = profile,
+                        similarity = SpeakerEmbeddingSerializer.cosineSimilarity(query, profile.centroidVector)
+                    )
+                }
+                .sortedByDescending { it.similarity }
+        }
+
+    /** Extracts a CAM++ embedding for enrollment audio, rejecting unusable vectors. */
+    private fun extractValidatedEmbedding(samples16kMono: FloatArray): FloatArray {
+        val embedding = withExtractor(resolveVerifiedEmbeddingModelPath()) { extractor ->
+            extractNormalizedEmbedding(extractor, samples16kMono)
+        } ?: throw IllegalStateException("Could not extract a speaker embedding from this audio")
+        if (embedding.isEmpty() || embedding.any { !it.isFinite() }) {
+            throw IllegalStateException("Extracted speaker embedding failed validation")
+        }
+        return embedding
+    }
+
+    private fun resolveVerifiedEmbeddingModelPath(): String =
+        resolveVerifiedModelFile(CAMPLUS_ZH_EN_ASSET)
+            ?: throw IllegalStateException("CAM++ speaker model is not available; download it in Settings → Models")
+
+    /** Runs [block] with a standalone CAM++ extractor, releasing it even on Error. */
+    private inline fun <T> withExtractor(modelPath: String, block: (SpeakerEmbeddingExtractor) -> T): T {
+        val extractor = SpeakerEmbeddingExtractor(
+            config = SpeakerEmbeddingExtractorConfig(model = modelPath, numThreads = 4, debug = false, provider = "cpu")
+        )
+        return try {
+            block(extractor)
+        } finally {
+            try {
+                extractor.release()
+            } catch (t: Throwable) {
+                warn("Extractor release failed: ${t.message}")
+            }
+        }
+    }
+
+    // (Removed) enrollOrUpdateSpeakerProfile: post-meeting cluster enrollment
+    // was removed with the detail-screen speaker sheet. Direct-microphone
+    // enrollment lives in SpeakerProfilesScreen via enrollSpeakerFromAudioSamples.
+
+    /**
+     * Validates the new embedding and persists the profile (running
+     * L2-normalized mean across historical samples) plus the raw sample row.
+     */
+    private suspend fun persistEnrollment(
+        normalizedSample: FloatArray,
+        displayName: String,
+        existingProfileId: String?,
+        badgeColorHex: String?,
+        sourceSessionId: String?,
+        durationMs: Long
+    ): SpeakerProfileRecord {
+        if (normalizedSample.isEmpty() || normalizedSample.any { !it.isFinite() }) {
+            throw IllegalStateException("Speaker embedding failed validation")
+        }
+        val store = profileStore
+            ?: throw IllegalStateException("SpeakerDiarizer needs a SpeakerProfileStore to enroll speakers")
+        val now = System.currentTimeMillis()
+
+        val existing = existingProfileId?.let { store.getProfileById(it) }
+        if (existing != null && existing.centroidVector.size != normalizedSample.size) {
+            // Vectors from different speaker model families must never blend.
+            throw IllegalStateException(
+                "Profile '${existing.displayName}' was enrolled with a different speaker model family; enroll it as a new profile"
+            )
+        }
+
+        val updatedProfile = if (existing != null) {
             // Running L2-normalized mean across historical samples + new sample
             val n = existing.sampleCount.coerceAtLeast(1)
             val combined = FloatArray(normalizedSample.size) { i ->
@@ -470,11 +612,11 @@ class SpeakerDiarizer(
                 updatedAtMs = now
             )
         } else {
-            val color = badgeColorHex ?: DEFAULT_BADGE_COLORS[abs(displayName.hashCode()) % DEFAULT_BADGE_COLORS.size]
             SpeakerProfileRecord(
                 profileId = existingProfileId ?: UUID.randomUUID().toString(),
                 displayName = displayName.trim().ifEmpty { "Speaker" },
-                badgeColorHex = color,
+                badgeColorHex = badgeColorHex
+                    ?: DEFAULT_BADGE_COLORS[abs(displayName.hashCode()) % DEFAULT_BADGE_COLORS.size],
                 sampleCount = 1,
                 centroidVector = normalizedSample,
                 createdAtMs = now,
@@ -482,21 +624,44 @@ class SpeakerDiarizer(
             )
         }
 
-        store?.upsertProfile(
+        store.upsertProfile(
             profile = updatedProfile,
             newSampleEmbedding = normalizedSample,
-            sourceSessionId = sessionId,
-            durationMs = sampleDurationMs
+            sourceSessionId = sourceSessionId,
+            durationMs = durationMs
         )
-        store?.updateSessionClusterProfile(
-            sessionId = sessionId,
-            clusterId = clusterId,
-            speakerProfileId = updatedProfile.profileId,
-            speakerLabel = updatedProfile.displayName,
-            badgeColorHex = updatedProfile.badgeColorHex
-        )
+        return updatedProfile
+    }
 
-        updatedProfile
+    /** Profiles whose vector dimension differs from the active model's can
+     *  never match; surface that loudly instead of silently skipping. */
+    private fun warnOnModelFamilyMismatch(profiles: List<SpeakerProfileRecord>, embeddingDim: Int) {
+        val mismatched = profiles.filter { it.centroidVector.isNotEmpty() && it.centroidVector.size != embeddingDim }
+        if (mismatched.isNotEmpty()) {
+            warn(
+                "${mismatched.size} enrolled profile(s) use a different speaker model family " +
+                    "(${mismatched.first().centroidVector.size}-dim vs $embeddingDim-dim) and are excluded from matching; re-enroll those speakers"
+            )
+        }
+    }
+
+    /** Last-resort turns when the standalone extractor layer fails: keep
+     *  pyannote's speaker separation with anonymous labels instead of
+     *  discarding diarization entirely. */
+    private fun anonymousTurnsFromSegments(segments: List<OfflineSpeakerDiarizationSegment>): List<DiarizationTurn> {
+        val orderIndexBySpeaker = segments.map { it.speaker }.distinct().withIndex().associate { (i, s) -> s to i }
+        return segments.map { seg ->
+            val idx = orderIndexBySpeaker[seg.speaker] ?: 0
+            DiarizationTurn(
+                startMs = (seg.start * 1000f).toLong(),
+                endMs = (seg.end * 1000f).toLong(),
+                clusterId = seg.speaker,
+                speakerProfileId = null,
+                speakerLabel = "Speaker ${idx + 1}",
+                badgeColorHex = DEFAULT_BADGE_COLORS[idx % DEFAULT_BADGE_COLORS.size],
+                clusterCentroid = FloatArray(0)
+            )
+        }
     }
 
     /**
@@ -750,28 +915,68 @@ class SpeakerDiarizer(
     }
 
     /**
-     * Resolves an ONNX model path on disk (checking downloaded models dir first, then extracting from APK assets).
+     * Resolves a verified diarization ONNX model path (v2.1 Root Cause C):
+     * handing JNI an unverified path aborts natively (`ptr == 0L`).
+     *
+     * Checks each candidate in order — the exact path under `files/models`,
+     * then a recursive scan of `files/` by file name (downloaded models may
+     * live in differently named folders), then the APK asset at the exact
+     * path, then a recursive asset scan by file name (asset hits are
+     * extracted to `files/bundled_models`). Generic names such as
+     * `model.int8.onnx` are only accepted under the candidate's expected
+     * folder so the scan can never grab another model's ONNX. Returns null
+     * when no real, non-empty copy exists so callers fall back instead of
+     * crashing.
      */
-    private fun resolveModelFile(primaryRelativePath: String, fallbackRelativePath: String): String {
-        val appContext = requireNotNull(context) { "SpeakerDiarizer needs a Context for model resolution" }
+    private fun resolveVerifiedModelFile(vararg candidatePaths: String): String? {
+        val appContext = context ?: return null
         val modelsRoot = File(appContext.filesDir, "models")
-        val downloadedPrimary = File(modelsRoot, primaryRelativePath)
-        if (downloadedPrimary.exists() && downloadedPrimary.length() > 0L) {
-            return downloadedPrimary.absolutePath
+
+        for (candidate in candidatePaths) {
+            val fileName = candidate.substringAfterLast('/')
+            val dirHint = candidate.substringBeforeLast('/', missingDelimiterValue = "")
+                .ifEmpty { null }
+
+            File(modelsRoot, candidate)
+                .takeIf { it.isFile && it.length() > 0L }
+                ?.let { return it.absolutePath }
+            findFileByNameRecursive(appContext.filesDir, fileName, dirHint)?.let { return it.absolutePath }
+
+            extractAssetIfPresent(candidate)?.let { return it.absolutePath }
+            findAssetFileNameRecursive(appContext, "", fileName, dirHint)?.let { assetRel ->
+                extractAssetIfPresent(assetRel)?.let { return it.absolutePath }
+            }
         }
+        return null
+    }
 
-        val cachedPrimary = extractAssetIfPresent(primaryRelativePath)
-        if (cachedPrimary != null) return cachedPrimary.absolutePath
-
-        val downloadedFallback = File(modelsRoot, fallbackRelativePath)
-        if (downloadedFallback.exists() && downloadedFallback.length() > 0L) {
-            return downloadedFallback.absolutePath
+    private fun findFileByNameRecursive(dir: File, fileName: String, dirHint: String?): File? {
+        val children = dir.listFiles() ?: return null
+        for (child in children) {
+            if (child.isDirectory) {
+                findFileByNameRecursive(child, fileName, dirHint)?.let { return it }
+            } else if (child.length() > 0L && child.name == fileName && matchesDirHint(child.parent, dirHint)) {
+                return child
+            }
         }
+        return null
+    }
 
-        val cachedFallback = extractAssetIfPresent(fallbackRelativePath)
-        if (cachedFallback != null) return cachedFallback.absolutePath
+    private fun matchesDirHint(parentPath: String?, dirHint: String?): Boolean =
+        dirHint == null || parentPath?.contains(dirHint) == true
 
-        return downloadedPrimary.absolutePath
+    private fun findAssetFileNameRecursive(context: Context, dir: String, fileName: String, dirHint: String?): String? {
+        val children = try {
+            context.assets.list(dir) ?: return null
+        } catch (t: Throwable) {
+            return null
+        }
+        for (child in children) {
+            val rel = if (dir.isEmpty()) child else "$dir/$child"
+            if (child == fileName && matchesDirHint(rel.substringBeforeLast('/'), dirHint)) return rel
+            findAssetFileNameRecursive(context, rel, fileName, dirHint)?.let { return it }
+        }
+        return null
     }
 
     private fun extractAssetIfPresent(assetPath: String): File? {
@@ -781,12 +986,16 @@ class SpeakerDiarizer(
             if (outFile.exists() && outFile.length() > 0L) return outFile
             outFile.parentFile?.mkdirs()
             appContext.assets.open(assetPath).use { input ->
-                FileOutputStream(outFile).use { output ->
-                    input.copyTo(output)
+                val temp = File.createTempFile("model-", ".tmp", outFile.parentFile)
+                try {
+                    FileOutputStream(temp).use { output -> input.copyTo(output) }
+                    check(temp.length() > 0L && temp.renameTo(outFile)) { "Could not install bundled model" }
+                } finally {
+                    temp.delete()
                 }
             }
             outFile
-        } catch (e: Exception) {
+        } catch (t: Throwable) {
             null
         }
     }
@@ -841,9 +1050,18 @@ class SpeakerDiarizer(
                 }
                 floatSamples
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to read WAV file ${wavFile.absolutePath}", e)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed to read WAV file ${wavFile.absolutePath}", t)
             FloatArray(0)
+        }
+    }
+
+    /** Logging must never crash the pipeline: JNI failure paths surface as
+     *  Errors, and android.util.Log throws in JVM unit tests. */
+    private fun warn(msg: String, t: Throwable? = null) {
+        try {
+            if (t != null) Log.w(TAG, msg, t) else Log.w(TAG, msg)
+        } catch (_: Throwable) {
         }
     }
 

@@ -37,21 +37,4 @@ interface TranscriptSegmentDao {
         insertSegments(segments)
         updateInlineTranscriptText(sessionId, inlineText)
     }
-
-    @Query(
-        """
-        UPDATE meeting_transcript_segments
-        SET speakerProfileId = :speakerProfileId,
-            speakerLabel = :speakerLabel,
-            badgeColorHex = :badgeColorHex
-        WHERE sessionId = :sessionId AND clusterId = :clusterId
-        """
-    )
-    suspend fun updateClusterSpeakerAttribution(
-        sessionId: String,
-        clusterId: Int,
-        speakerProfileId: String,
-        speakerLabel: String,
-        badgeColorHex: String
-    )
 }

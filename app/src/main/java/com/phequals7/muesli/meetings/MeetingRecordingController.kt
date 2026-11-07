@@ -34,9 +34,11 @@ object MeetingRecordingController {
     /** Diarization pass progress 0..1 while [isFinalizing]. */
     var diarizationProgress by mutableFloatStateOf(0f)
         private set
+    /** Human-readable finalization stage ("Processing meeting", "Identifying speakers", "Saving recording", "Generating summary"). */
+    var finalizationStatus by mutableStateOf("Processing meeting")
+        private set
     /** Speaker count hint for constrained clustering: -1 = Auto, or 2/3/4/5. */
     var expectedSpeakerCount by mutableIntStateOf(-1)
-
     val isActive: Boolean get() = isRecording || isFinalizing
 
     fun start(
@@ -77,8 +79,8 @@ object MeetingRecordingController {
         isRecording = true
         isFinalizing = false
         elapsedSeconds = 0
-
         diarizationProgress = 0f
+        finalizationStatus = "Processing meeting"
         inputLevel = 0f
         partialText = ""
         liveTranscript = ""
@@ -94,7 +96,12 @@ object MeetingRecordingController {
     fun onFinalizing() {
         isRecording = false
         isFinalizing = true
+        finalizationStatus = "Processing meeting"
         inputLevel = 0f
+    }
+
+    fun onFinalizationStatus(status: String) {
+        finalizationStatus = status
     }
 
     fun onDiarizationProgress(progress: Float) {
@@ -108,6 +115,7 @@ object MeetingRecordingController {
         meetingTitle = ""
         elapsedSeconds = 0
         diarizationProgress = 0f
+        finalizationStatus = "Processing meeting"
         inputLevel = 0f
         partialText = ""
         liveTranscript = ""

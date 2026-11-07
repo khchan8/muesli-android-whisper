@@ -1,7 +1,10 @@
 package com.phequals7.muesli.meetings
 
 import com.phequals7.muesli.ui.dashboard.meetings.findActiveTranscriptSegmentIndex
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import kotlin.math.abs
 
@@ -130,5 +133,43 @@ class SpeakerDiarizerLogicTest {
         assertEquals(-1, findActiveTranscriptSegmentIndex(segments, 1_600)) // 600ms past end
         assertEquals(-1, findActiveTranscriptSegmentIndex(emptyList(), 0))
         assertEquals(-1, findActiveTranscriptSegmentIndex(segments, 10_000))
+    }
+
+    // ── v2.1 crash-safety & enrollment contract guards ────────────────
+
+    @Test
+    fun `enrollment rejects clips shorter than 6 seconds`() = runBlocking {
+        val diarizer = SpeakerDiarizer(context = null, profileStore = null)
+        try {
+            diarizer.enrollSpeakerFromAudioSamples(FloatArray(16000 * 5), "Alice") // 5 s
+            fail("Expected IllegalArgumentException")
+        } catch (_: IllegalArgumentException) {
+            // The duration gate fires before any model or IO work.
+        }
+    }
+
+    @Test
+    fun `enrollment throws when the embedding model is unavailable`() = runBlocking {
+        val diarizer = SpeakerDiarizer(context = null, profileStore = null)
+        try {
+            diarizer.enrollSpeakerFromAudioSamples(FloatArray(16000 * 8), "Alice")
+            fail("Expected IllegalStateException")
+        } catch (e: IllegalStateException) {
+            assertTrue(e.message!!.contains("model", ignoreCase = true))
+        }
+    }
+
+    @Test
+    fun `identification without enrolled profiles returns empty without loading models`() = runBlocking {
+        val diarizer = SpeakerDiarizer(context = null, profileStore = null)
+        assertTrue(diarizer.identifySpeakerFromAudioSamples(FloatArray(16000 * 8)).isEmpty())
+    }
+
+    @Test
+    fun `diarization degrades to no turns when models are unavailable`() = runBlocking {
+        // v2.1 Root Cause C: missing model files must never reach JNI; the
+        // caller falls back to timestamped single-speaker segments.
+        val turns = SpeakerDiarizer(context = null).diarizeSamples(FloatArray(16000 * 2))
+        assertTrue(turns.isEmpty())
     }
 }

@@ -85,7 +85,6 @@ fun VoiceNotesTab(
     var partialText by remember { mutableStateOf("") }
     var inputLevel by remember { mutableFloatStateOf(0f) }
     var elapsedSeconds by remember { mutableIntStateOf(0) }
-    var keepMicReady by remember { mutableStateOf(store.keepMicReady) }
 
     var activeEngine by remember { mutableStateOf<com.phequals7.muesli.engine.TranscriptionEngine?>(null) }
     var recordingStartedAt by remember { mutableLongStateOf(0L) }
@@ -232,41 +231,6 @@ fun VoiceNotesTab(
             }
         }
 
-        // ── Keep mic ready ──────────────────────────────────────────────
-        item {
-            MuesliSurfaceCard {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(MuesliSpacing.s12),
-                    modifier = Modifier.padding(MuesliSpacing.s16)
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(40.dp)
-                            .clip(CircleShape)
-                            .background(colors.brandBlueSubtle),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(Icons.Default.Mic, contentDescription = null, tint = colors.accent)
-                    }
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("Keep mic ready", color = colors.textPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                        Text(
-                            "The keyboard prewarms when it opens — recording starts only when you tap the mic.",
-                            color = colors.textSecondary,
-                            fontSize = 12.sp
-                        )
-                    }
-                    Switch(
-                        checked = keepMicReady,
-                        onCheckedChange = {
-                            keepMicReady = it
-                            store.keepMicReady = it
-                        }
-                    )
-                }
-            }
-        }
 
         // ── Hero record card ────────────────────────────────────────────
         item {

@@ -35,12 +35,16 @@ import com.phequals7.muesli.data.SharedStore
 import com.phequals7.muesli.data.entity.RecordingSession
 import com.phequals7.muesli.meetings.MeetingRecordingController
 import com.phequals7.muesli.meetings.MeetingTemplate
+import com.phequals7.muesli.meetings.MeetingSummaryService
+import com.phequals7.muesli.meetings.RecordingExportAccess
+import com.phequals7.muesli.meetings.rememberRecordingsFolderPicker
 import com.phequals7.muesli.model.ModelManager
 import com.phequals7.muesli.model.SpeechModels
 import com.phequals7.muesli.theme.MuesliCorners
 import com.phequals7.muesli.theme.MuesliSpacing
 import com.phequals7.muesli.theme.MuesliTheme
 import com.phequals7.muesli.ui.components.MuesliElapsedBadge
+import kotlinx.coroutines.launch
 import com.phequals7.muesli.ui.components.MuesliInlineWaveform
 import com.phequals7.muesli.ui.components.MuesliWaveformMode
 import com.phequals7.muesli.ui.dashboard.voicenotes.MuesliSurfaceCard
@@ -65,16 +69,27 @@ fun MeetingsTab(
 
     var meetings by remember { mutableStateOf(emptyList<RecordingSession>()) }
     var selectedMeetingId by remember { mutableStateOf<String?>(null) }
+    var folderPickerError by remember { mutableStateOf<String?>(null) }
 
     var titleInput by remember { mutableStateOf("") }
     var selectedTemplate by remember { mutableStateOf(MeetingTemplate.fromId(store.defaultMeetingTemplate)) }
     var searchQuery by remember { mutableStateOf("") }
-    var speakerCountHint by remember { mutableIntStateOf(-1) }
     var languageHint by remember { mutableStateOf(store.languageHint) }
 
     val modelReady = remember { ModelManager.getInstance(context.applicationContext).isDownloaded() }
+    val summaryProgress by MeetingSummaryService.progress.collectAsState()
+    val summaryBusy = summaryProgress != null
+    var folderRevision by remember { mutableIntStateOf(0) }
+    val chooseFolder = rememberRecordingsFolderPicker(store, onSelected = { folderRevision++ }) { folderPickerError = it }
+    val recordingsFolder = remember(folderRevision, store.recordingsTreeUri) {
+        RecordingExportAccess.describeFolder(context, store.recordingsTreeUri)
+    }
 
     LaunchedEffect(Unit) {
+        // Rows left `generating` by a dead process become failed/retryable here.
+        launch {
+            runCatching { MeetingSummaryService.reconcileStaleGenerating(context.applicationContext, store) }
+        }
         store.getRecordingSessionsFlow().collect { meetings = it.filter { s -> s.kind == "meeting" } }
     }
 
@@ -83,6 +98,7 @@ fun MeetingsTab(
     ) { }
 
     fun startMeeting() {
+        if (MeetingRecordingController.isActive || summaryBusy) return
         if (Build.VERSION.SDK_INT >= 33) {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
@@ -90,12 +106,8 @@ fun MeetingsTab(
             "Meeting ${SimpleDateFormat("MMM dd, HH:mm", Locale.getDefault()).format(Date())}"
         }
         store.languageHint = languageHint
-        // 1:1 template implies 2 speakers unless the user chose a hint explicitly.
-        val effectiveCount = when {
-            speakerCountHint > 0 -> speakerCountHint
-            selectedTemplate == MeetingTemplate.ONE_ON_ONE -> 2
-            else -> -1
-        }
+        // The 1:1 template implies two speakers; every other template uses Auto.
+        val effectiveCount = if (selectedTemplate == MeetingTemplate.ONE_ON_ONE) 2 else -1
         MeetingRecordingController.start(context, UUID.randomUUID().toString(), title, selectedTemplate.id, effectiveCount)
         titleInput = ""
     }
@@ -188,21 +200,7 @@ fun MeetingsTab(
                             onSelected = { selectedTemplate = it }
                         )
 
-                        // v2: speaker count hint + language chips (Auto / EN / TH / ZH / YUE)
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text("Speakers:", color = colors.textSecondary, fontSize = 12.sp)
-                            listOf(-1 to "Auto", 2 to "2", 3 to "3", 4 to "4", 5 to "5+").forEach { (count, label) ->
-                                FilterChip(
-                                    selected = speakerCountHint == count,
-                                    onClick = { speakerCountHint = count },
-                                    label = { Text(label, fontSize = 11.sp) }
-                                )
-                            }
-                        }
+                        // Language chips (Auto / EN / TH / ZH / YUE)
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -225,10 +223,13 @@ fun MeetingsTab(
                                 fontSize = 11.sp
                             )
                         }
+                        if (summaryBusy) {
+                            Text(MeetingSummaryService.BUSY_MESSAGE, color = colors.destructive, fontSize = 11.sp)
+                        }
 
                         Button(
                             onClick = { startMeeting() },
-                            enabled = modelReady,
+                            enabled = modelReady && !summaryBusy,
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = colors.accent,
                                 disabledContainerColor = colors.accent.copy(alpha = 0.3f)
@@ -241,6 +242,35 @@ fun MeetingsTab(
                             Icon(Icons.Default.Mic, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(modifier = Modifier.width(MuesliSpacing.s8))
                             Text("Start Meeting", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Recordings folder setup ────────────────────────────────────
+        if (!MeetingRecordingController.isActive && store.retainMeetingAudio && recordingsFolder == null) {
+            item {
+                MuesliSurfaceCard {
+                    Column(
+                        modifier = Modifier.padding(MuesliSpacing.s16),
+                        verticalArrangement = Arrangement.spacedBy(MuesliSpacing.s8)
+                    ) {
+                        Text("Export recordings", color = colors.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "Choose a recordings folder once so finished meetings save their WAV and SRT files where other apps can see them.",
+                            color = colors.textSecondary,
+                            fontSize = 12.sp
+                        )
+                        folderPickerError?.let {
+                            Text(it, color = colors.destructive, fontSize = 11.sp)
+                        }
+                        Button(
+                            onClick = { folderPickerError = null; chooseFolder() },
+                            colors = ButtonDefaults.buttonColors(containerColor = colors.accent),
+                            shape = RoundedCornerShape(MuesliCorners.medium)
+                        ) {
+                            Text("Choose recordings folder", fontSize = 13.sp)
                         }
                     }
                 }
@@ -311,6 +341,7 @@ fun MeetingsTab(
             items(filtered, key = { it.id }) { meeting ->
                 MeetingRow(
                     meeting = meeting,
+                    summarySessionId = summaryProgress?.sessionId,
                     onClick = { selectedMeetingId = meeting.id }
                 )
             }
@@ -430,10 +461,11 @@ private fun ActiveMeetingCard(
                         .height(48.dp)
                 )
                 Spacer(modifier = Modifier.height(MuesliSpacing.s8))
+                val status = MeetingRecordingController.finalizationStatus
                 val progress = MeetingRecordingController.diarizationProgress
-                if (MeetingRecordingController.isFinalizing && progress > 0f) {
+                if (MeetingRecordingController.isFinalizing && status == "Identifying speakers" && progress > 0f) {
                     Text(
-                        text = "Identifying speakers (CAM++) · ${(progress * 100).toInt()}%",
+                        text = "$status · ${(progress * 100).toInt()}%",
                         color = colors.textSecondary,
                         fontSize = 12.sp
                     )
@@ -444,52 +476,59 @@ private fun ActiveMeetingCard(
                     )
                 } else {
                     Text(
-                        text = if (MeetingRecordingController.isFinalizing) "Transcribing remaining audio" else "Listening",
+                        text = if (MeetingRecordingController.isFinalizing) status else "Listening",
                         color = colors.textSecondary,
                         fontSize = 12.sp
                     )
                 }
             }
 
-            // Stop + Discard
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(MuesliSpacing.s12),
-                modifier = Modifier.fillMaxWidth()
-            ) {
+            // Stop + Discard exist only while actually recording; during
+            // finalization the card shows the live stage instead of dead,
+            // disabled controls. Once saved, this card disappears entirely
+            // and the saved meeting's detail owns any summary progress.
+            if (MeetingRecordingController.isRecording) {
                 Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.Center,
-                    modifier = Modifier
-                        .weight(1f)
-                        .clip(RoundedCornerShape(MuesliCorners.medium))
-                        .background(colors.destructiveSubtle)
-                        .border(1.dp, colors.destructive.copy(alpha = 0.35f), RoundedCornerShape(MuesliCorners.medium))
-                        .clickable(enabled = !MeetingRecordingController.isFinalizing) { onDiscard() }
-                        .padding(vertical = MuesliSpacing.s12)
+                    horizontalArrangement = Arrangement.spacedBy(MuesliSpacing.s12),
+                    modifier = Modifier.fillMaxWidth()
                 ) {
-                    Icon(Icons.Default.Close, contentDescription = null, tint = colors.destructive, modifier = Modifier.size(15.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Discard", color = colors.destructive, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center,
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(MuesliCorners.medium))
+                            .background(colors.destructiveSubtle)
+                            .border(1.dp, colors.destructive.copy(alpha = 0.35f), RoundedCornerShape(MuesliCorners.medium))
+                            .clickable { onDiscard() }
+                            .padding(vertical = MuesliSpacing.s12)
+                    ) {
+                        Icon(Icons.Default.Close, contentDescription = null, tint = colors.destructive, modifier = Modifier.size(15.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Discard", color = colors.destructive, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center,
+                        modifier = Modifier
+                            .weight(2f)
+                            .clip(RoundedCornerShape(MuesliCorners.medium))
+                            .background(colors.destructive)
+                            .clickable { onStop() }
+                            .padding(vertical = MuesliSpacing.s12)
+                    ) {
+                        Icon(Icons.Default.Stop, contentDescription = null, tint = Color.White, modifier = Modifier.size(15.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Stop Meeting", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                    }
                 }
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.Center,
-                    modifier = Modifier
-                        .weight(2f)
-                        .clip(RoundedCornerShape(MuesliCorners.medium))
-                        .background(colors.destructive)
-                        .clickable(enabled = !MeetingRecordingController.isFinalizing) { onStop() }
-                        .padding(vertical = MuesliSpacing.s12)
-                ) {
-                    Icon(Icons.Default.Stop, contentDescription = null, tint = Color.White, modifier = Modifier.size(15.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        if (MeetingRecordingController.isFinalizing) "Finishing..." else "Stop Meeting",
-                        color = Color.White,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
+            } else {
+                Text(
+                    text = "Finishing — you can leave the app; the summary continues on its own.",
+                    color = colors.textSecondary,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(top = MuesliSpacing.s4)
+                )
             }
         }
     }
@@ -498,12 +537,17 @@ private fun ActiveMeetingCard(
 @Composable
 private fun MeetingRow(
     meeting: RecordingSession,
+    summarySessionId: String?,
     onClick: () -> Unit,
 ) {
     val colors = MuesliTheme.colors
 
     val (badgeText, badgeColor) = when (meeting.phase) {
-        "completed" -> "Complete" to colors.syncGreen
+        "completed" -> when {
+            summarySessionId == meeting.id -> "Summarizing" to colors.transcribing
+            meeting.summaryState == "failed" -> "Summary failed" to colors.destructive
+            else -> "Complete" to colors.syncGreen
+        }
         "recording" -> "Recording" to colors.accent
         "transcribing" -> "Transcribing" to colors.transcribing
         "failed" -> "Failed" to colors.destructive

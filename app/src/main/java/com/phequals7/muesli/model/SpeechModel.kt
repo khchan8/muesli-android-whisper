@@ -38,13 +38,18 @@ data class RemoteModelFile(
     val relativeDestinationPath: String,
     val primaryUrl: String,
     val fallbackUrls: List<String> = emptyList(),
-    val expectedMinBytes: Long = 128L
+    val expectedMinBytes: Long = 128L,
+    /** Exact byte size when known (GGUF manifests); the download is verified against it. */
+    val expectedBytes: Long? = null,
+    /** Pinned SHA-256 (hex) verified on the `.part` file before promotion. */
+    val sha256: String? = null
 )
 
 enum class ModelCategory {
     ASR_MULTILINGUAL,
     ASR_LEGACY,
-    SPEAKER_DIARIZATION
+    SPEAKER_DIARIZATION,
+    SUMMARY_LLM
 }
 
 /**
@@ -83,9 +88,15 @@ data class SpeechModelSpec(
         }
         val baseDir = if (targetFolderName.isEmpty()) modelsRootDir else File(modelsRootDir, targetFolderName)
         if (!baseDir.exists()) return false
+        val manifestFiles = (delivery as? ModelDeliverySpec.DirectFileManifest)?.files?.associateBy { it.relativeDestinationPath }
         return requiredRelativeFiles.all { relPath ->
             val file = File(baseDir, relPath)
-            file.exists() && file.isFile && file.length() > 64L
+            if (!file.exists() || !file.isFile || file.length() <= 64L) return@all false
+            val remote = manifestFiles?.get(relPath)
+            if (remote?.expectedBytes != null && file.length() != remote.expectedBytes) return@all false
+            // GGUF header starts with the 4-byte ASCII magic "GGUF" (cheap, safe during recomposition).
+            if (relPath.endsWith(".gguf", ignoreCase = true) && !hasGgufMagic(file)) return@all false
+            true
         }
     }
 }
@@ -441,11 +452,70 @@ object SpeechModels {
         CAMPLUS_ZH_EN_SPEAKER_EMBEDDING,
         PYANNOTE_SEGMENTATION_3_0
     )
+    // ========================================================================
+    // 4. ON-DEVICE SUMMARY LLMs (Qwen3 GGUF via embedded llama.cpp)
+    // ========================================================================
+
+    val QWEN3_SUMMARY_1_7B_Q4_K_M = SpeechModelSpec(
+        id = "qwen3-summary-1.7b-q4-k-m",
+        title = "Qwen3 1.7B (Q4_K_M GGUF)",
+        subtitle = "Default on-device meeting summary & title generator (EN + Thai + Chinese, ~1.1 GB)",
+        category = ModelCategory.SUMMARY_LLM,
+        asrModelType = null,
+        targetFolderName = "qwen3-summary-1.7b",
+        supportedLanguages = listOf("en", "th", "zh", "yue"),
+        approxDownloadSizeMb = 1056,
+        approxRamFootprintMb = 1800,
+        recommendedForMixFold3 = true,
+        requiredRelativeFiles = listOf("Qwen3-1.7B-Q4_K_M.gguf"),
+        delivery = ModelDeliverySpec.DirectFileManifest(
+            files = listOf(
+                RemoteModelFile(
+                    relativeDestinationPath = "Qwen3-1.7B-Q4_K_M.gguf",
+                    primaryUrl = "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/d7f544eead698dbd1f15126ef60b45a1e1933222/Qwen3-1.7B-Q4_K_M.gguf",
+                    expectedMinBytes = 1_107_409_472L,
+                    expectedBytes = 1_107_409_472L,
+                    sha256 = "b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897"
+                )
+            )
+        )
+    )
+
+    val QWEN3_SUMMARY_4B_Q4_K_M = SpeechModelSpec(
+        id = "qwen3-summary-4b-q4-k-m",
+        title = "Qwen3 4B (Q4_K_M GGUF)",
+        subtitle = "Higher-detail on-device meeting minutes for 12GB RAM devices (~2.5 GB)",
+        category = ModelCategory.SUMMARY_LLM,
+        asrModelType = null,
+        targetFolderName = "qwen3-summary-4b",
+        supportedLanguages = listOf("en", "th", "zh", "yue"),
+        approxDownloadSizeMb = 2382,
+        approxRamFootprintMb = 3200,
+        recommendedForMixFold3 = true,
+        requiredRelativeFiles = listOf("Qwen3-4B-Q4_K_M.gguf"),
+        delivery = ModelDeliverySpec.DirectFileManifest(
+            files = listOf(
+                RemoteModelFile(
+                    relativeDestinationPath = "Qwen3-4B-Q4_K_M.gguf",
+                    primaryUrl = "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/bc640142c66e1fdd12af0bd68f40445458f3869b/Qwen3-4B-Q4_K_M.gguf",
+                    expectedMinBytes = 2_497_280_256L,
+                    expectedBytes = 2_497_280_256L,
+                    sha256 = "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5"
+                )
+            )
+        )
+    )
+
+    /** Optional on-device Qwen3 GGUF models for meeting summaries. */
+    val summaryModels: List<SpeechModelSpec> = listOf(
+        QWEN3_SUMMARY_1_7B_Q4_K_M,
+        QWEN3_SUMMARY_4B_Q4_K_M
+    )
 
     /**
      * Complete registry including internal composite components.
      */
-    val allModels: List<SpeechModelSpec> = selectableAsrModels + diarizationModels + listOf(
+    val allModels: List<SpeechModelSpec> = selectableAsrModels + diarizationModels + summaryModels + listOf(
         SENSEVOICE_SMALL_COMPONENT,
         ZIPFORMER_THAI_COMPONENT
     )
@@ -453,11 +523,27 @@ object SpeechModels {
     fun findById(id: String): SpeechModelSpec? = allModels.firstOrNull { it.id == id }
 
     const val DEFAULT_ID = "qwen3-asr-0.6b-int8"
+    const val DEFAULT_SUMMARY_MODEL_ID = "qwen3-summary-1.7b-q4-k-m"
 
     /** Resolves a stored selection; unknown/blank ids fall back to the v2 default. */
     fun byId(id: String?): SpeechModelSpec =
         selectableAsrModels.firstOrNull { it.id == id } ?: QWEN3_ASR_0_6B_INT8
 
+    /** Resolves a stored local summary model id; unknown/blank ids fall back to 1.7B. */
+    fun summaryById(id: String?): SpeechModelSpec =
+        summaryModels.firstOrNull { it.id == id } ?: QWEN3_SUMMARY_1_7B_Q4_K_M
+
     fun selected(context: android.content.Context): SpeechModelSpec =
         byId(com.phequals7.muesli.data.SharedStore(context.applicationContext).selectedModelId)
+}
+
+internal fun hasGgufMagic(file: File): Boolean = try {
+    if (file.length() < 4L) false
+    else file.inputStream().use { input ->
+        val b = ByteArray(4)
+        input.read(b) == 4 && b[0] == 'G'.code.toByte() && b[1] == 'G'.code.toByte() &&
+            b[2] == 'U'.code.toByte() && b[3] == 'F'.code.toByte()
+    }
+} catch (_: Exception) {
+    false
 }
