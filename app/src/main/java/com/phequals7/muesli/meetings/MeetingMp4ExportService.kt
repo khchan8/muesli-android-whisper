@@ -507,6 +507,8 @@ class MeetingMp4ExportService : Service() {
                             ownedMp4Uri = snapshot.ownedMp4Uri,
                             ownedMp4Fingerprint = snapshot.ownedMp4Fingerprint,
                             currentFingerprint = snapshot.fingerprint,
+                            mp4Subfolder = if (store.mp4SubfolderEnabled)
+                                MeetingStorageManager.MP4_SUBFOLDER else null,
                         )
                     }.getOrDefault(false)
                 }

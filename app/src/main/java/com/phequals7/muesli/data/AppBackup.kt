@@ -188,6 +188,7 @@ object AppBackupCodec {
 /** Reads/writes `muesli-backup.json` in the user's Recordings folder (SAF tree). */
 object AppBackup {
     const val FILE_NAME = "muesli-backup.json"
+    private const val SUBFOLDER = "backup"
 
     suspend fun backup(context: Context, treeUri: Uri, force: Boolean): Result<String> =
         withContext(Dispatchers.IO) {
@@ -196,7 +197,9 @@ object AppBackup {
                 val snapshot = snapshot(context, store)
                 val hash = AppBackupCodec.sha256Hex(AppBackupCodec.encode(snapshot, 0L))
                 val resolver = context.contentResolver
-                val existing = findBackup(context, treeUri)
+                val backupDir = subfolderDocId(context, treeUri, create = true)
+                    ?: throw IOException("The recordings folder refused to create the $SUBFOLDER subfolder")
+                val existing = findBackup(context, treeUri, backupDir)
                 if (!force) {
                     val existingAt = existing?.let {
                         runCatching { AppBackupCodec.decode(readText(context, it)).exportedAt }.getOrNull()
@@ -207,7 +210,7 @@ object AppBackup {
                 }
                 val target = existing ?: DocumentsContract.createDocument(
                     resolver,
-                    DocumentsContract.buildDocumentUriUsingTree(treeUri, DocumentsContract.getTreeDocumentId(treeUri)),
+                    DocumentsContract.buildDocumentUriUsingTree(treeUri, backupDir),
                     "application/json", FILE_NAME,
                 ) ?: throw IOException("The recordings folder refused to create $FILE_NAME")
                 val now = System.currentTimeMillis()
@@ -224,7 +227,9 @@ object AppBackup {
     suspend fun restore(context: Context, treeUri: Uri): Result<String> =
         withContext(Dispatchers.IO) {
             runCatching {
-                val file = findBackup(context, treeUri)
+                val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
+                val file = subfolderDocId(context, treeUri, create = false)?.let { findBackup(context, treeUri, it) }
+                    ?: findBackup(context, treeUri, rootDocId) // pre-subfolder backups
                     ?: throw IOException("No $FILE_NAME found in the Recordings folder")
                 val decoded = AppBackupCodec.decode(readText(context, file))
                 val store = SharedStore(context)
@@ -261,9 +266,36 @@ object AppBackup {
         (context.contentResolver.openInputStream(uri) ?: throw IOException("Could not read $FILE_NAME"))
             .use { it.readBytes().toString(Charsets.UTF_8) }
 
-    private fun findBackup(context: Context, treeUri: Uri): Uri? {
+    private fun subfolderDocId(context: Context, treeUri: Uri, create: Boolean): String? {
+        val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
+        val children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, rootDocId)
+        context.contentResolver.query(
+            children,
+            arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+            ),
+            null, null, null,
+        )?.use { c ->
+            while (c.moveToNext()) {
+                if (c.getString(1) == SUBFOLDER &&
+                    c.getString(2) == DocumentsContract.Document.MIME_TYPE_DIR
+                ) return c.getString(0)
+            }
+        }
+        if (!create) return null
+        return DocumentsContract.createDocument(
+            context.contentResolver,
+            DocumentsContract.buildDocumentUriUsingTree(treeUri, rootDocId),
+            DocumentsContract.Document.MIME_TYPE_DIR, SUBFOLDER,
+        )?.let { DocumentsContract.getDocumentId(it) }
+            ?: throw IOException("The recordings folder refused to create the $SUBFOLDER subfolder")
+    }
+
+    private fun findBackup(context: Context, treeUri: Uri, parentDocId: String): Uri? {
         val children = DocumentsContract.buildChildDocumentsUriUsingTree(
-            treeUri, DocumentsContract.getTreeDocumentId(treeUri),
+            treeUri, parentDocId,
         )
         context.contentResolver.query(
             children,

@@ -409,6 +409,11 @@ class MeetingStorageManagerTest {
             names.remove(documentUri)
             return uri
         }
+
+        override fun childDirectoryGateway(
+            name: String,
+            create: Boolean,
+        ): MeetingStorageManager.RecordingTreeGateway? = null
     }
 
     // ── Stage 1: exportAudioToTree ───────────────────────────────────────
@@ -1479,6 +1484,46 @@ class MeetingStorageManagerTest {
                 ownedMp4Fingerprint = "fp1", currentFingerprint = "fp1"
             )
         )
+    }
+
+    @Test
+    fun `canSkipAutomaticMp4Export rebuilds when the mp4 subfolder is missing`() {
+        val gateway = FakeTreeGateway()
+        val audioUri = gateway.createDocument("audio/mp4", "Skip_2026-11-06_14-30-00-000.m4a")
+        val mp4Uri = gateway.createDocument("video/mp4", "Skip_2026-11-06_14-30-00-000.mp4")
+
+        assertFalse(
+            "No subfolder gateway means no owned subfolder MP4: rebuild",
+            MeetingStorageManager.canSkipAutomaticMp4Export(
+                gateway, force = false, audioUri = audioUri, ownedMp4Uri = mp4Uri,
+                ownedMp4Fingerprint = "fp1", currentFingerprint = "fp1",
+                mp4Subfolder = "mp4",
+            )
+        )
+    }
+
+    @Test
+    fun `mp4 subfolder export publishes through the child gateway and removes a superseded root mp4`() = runTest {
+        val dir = tempFolder.newFolder("mp4sub")
+        val stem = "Sub_2026-11-06_14-30-00-000"
+        val root = FakeTreeGateway()
+        val mp4Dir = FakeTreeGateway("tree://mp4/")
+        val audioUri = root.createDocument("audio/mp4", "$stem.m4a")
+        val oldRootMp4 = root.createDocument("video/mp4", "$stem.mp4")
+
+        var committed: String? = null
+        val outcome = MeetingStorageManager.exportMp4ToTree(
+            root, "s36", audioUri, ownedMp4Uri = oldRootMp4, generatedMp4 = generatedMp4(dir, 64),
+            mp4Gateway = mp4Dir,
+            commitUri = { uri -> committed = uri; true },
+            restoreOwnedUri = { error("restore must not run on success") }
+        )
+
+        assertEquals(mp4Dir.queryDisplayName(committed!!), "$stem.mp4")
+        assertEquals(committed, outcome.publishedUri)
+        assertEquals(64, root.contents.getValue(committed!!).size.toLong())
+        assertTrue("Superseded root MP4 must be deleted after commit", oldRootMp4 in root.deleted)
+        assertNull(root.names[oldRootMp4])
     }
 
     // ── MP4: request queue coalescing ────────────────────────────────────

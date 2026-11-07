@@ -50,6 +50,7 @@ class SharedStore(private val context: Context) {
         private const val KEY_RECORDINGS_TREE_URI = "recordings_tree_uri"
         private const val KEY_LANGUAGE_HINT = "language_hint" // "auto", "en", "th", "zh", "yue"
         private const val KEY_EXPORT_EMBEDDED_MP4 = "export_embedded_mp4_enabled"
+        private const val KEY_EXPORT_MP4_SUBFOLDER = "export_mp4_subfolder_enabled"
         private const val KEY_BACKUP_AUTO = "backup_auto_enabled"
         private const val KEY_BACKUP_LAST_AT = "backup_last_at"
         private const val KEY_BACKUP_LAST_HASH = "backup_last_hash"
@@ -216,6 +217,11 @@ class SharedStore(private val context: Context) {
     var exportEmbeddedMp4Enabled: Boolean
         get() = prefs.getBoolean(KEY_EXPORT_EMBEDDED_MP4, false)
         set(value) = prefs.edit().putBoolean(KEY_EXPORT_EMBEDDED_MP4, value).apply()
+
+    /** New MP4 exports go into an "mp4" subfolder of the recordings folder. */
+    var mp4SubfolderEnabled: Boolean
+        get() = prefs.getBoolean(KEY_EXPORT_MP4_SUBFOLDER, false)
+        set(value) = prefs.edit().putBoolean(KEY_EXPORT_MP4_SUBFOLDER, value).apply()
     var userProfileName: String
         get() = prefs.getString(KEY_USER_PROFILE_NAME, "") ?: ""
         set(value) = prefs.edit().putString(KEY_USER_PROFILE_NAME, value).apply()

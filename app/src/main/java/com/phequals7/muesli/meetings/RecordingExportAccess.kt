@@ -20,13 +20,21 @@ object RecordingExportAccess {
     fun parseTreeUri(stored: String): Uri? =
         stored.takeIf { it.isNotBlank() }?.let { runCatching { Uri.parse(it) }.getOrNull() }
 
-    /** Human-readable location of the chosen folder, e.g. `Recordings/Muesli`. */
+    /** Filesystem-style path of the chosen folder, e.g.
+     *  `/storage/emulated/0/Recordings/Muesli`; falls back to the raw
+     *  provider document id for exotic providers. */
     fun describeFolder(context: Context, stored: String): String? {
         val treeUri = parseTreeUri(stored) ?: return null
         val docId = runCatching { android.provider.DocumentsContract.getTreeDocumentId(treeUri) }
             .getOrNull() ?: return null
-        val label = docId.substringAfter(':').ifBlank { docId }
-        return label
+        val volume = docId.substringBefore(':', "")
+        val path = docId.substringAfter(':', "")
+        if (path.isBlank()) return docId
+        return when (volume) {
+            "primary" -> "/storage/emulated/0/$path"
+            "" -> path
+            else -> "/storage/$volume/$path"
+        }
     }
 
     /**

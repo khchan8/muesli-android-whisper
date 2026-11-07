@@ -554,6 +554,7 @@ object MeetingStorageManager {
                         ownedMp4Uri = latestSession.exportedMp4Uri,
                         ownedMp4Fingerprint = latestSession.mp4TranscriptFingerprint,
                         currentFingerprint = currentFingerprint,
+                        mp4Subfolder = if (store.mp4SubfolderEnabled) MP4_SUBFOLDER else null,
                     )
                     if (alreadyUpToDate) {
                         if (latestSession.mp4ExportError != null) {
@@ -664,6 +665,12 @@ object MeetingStorageManager {
         /** Renames a document and returns its URI afterwards (same URI when
          *  the provider renamed in place). Throws when the provider refuses. */
         fun renameDocument(documentUri: String, newDisplayName: String): String
+
+        /** Gateway rooted at the direct child directory [name] — created
+         *  first when [create]; null when absent and [create] is false.
+         *  Only documents directly inside that directory are in the child
+         *  gateway's tree. */
+        fun childDirectoryGateway(name: String, create: Boolean): RecordingTreeGateway?
     }
 
     internal data class ArtifactExportOutcome(
@@ -886,6 +893,8 @@ object MeetingStorageManager {
 
     private const val MIME_MP4 = "video/mp4"
     internal const val MP4_EXPORT_CACHE_DIR_PREFIX = "mp4_export_"
+    /** Recordings-folder subfolder for MP4 exports when the user opts in. */
+    internal const val MP4_SUBFOLDER = "mp4"
 
     /** Everything a muxing run captured under [artifactMutex]; publication
      *  re-validates all of it before anything becomes public. */
@@ -929,6 +938,8 @@ object MeetingStorageManager {
      * not forced, the fingerprint matches, both audio and owned MP4 are in
      * [gateway]'s selected tree with matching stems, and provider metadata
      * reports a positive document size. Missing/unknown size rebuilds.
+     * With [mp4Subfolder] set, the owned MP4 must live in that subfolder
+     * gateway instead (a missing subfolder rebuilds).
      */
     internal fun canSkipAutomaticMp4Export(
         gateway: RecordingTreeGateway,
@@ -937,16 +948,19 @@ object MeetingStorageManager {
         ownedMp4Uri: String?,
         ownedMp4Fingerprint: String?,
         currentFingerprint: String,
+        mp4Subfolder: String? = null,
     ): Boolean {
         if (force || ownedMp4Uri.isNullOrBlank() || ownedMp4Fingerprint.isNullOrBlank() ||
             ownedMp4Fingerprint != currentFingerprint
         ) return false
-        if (!gateway.isInTree(audioUri) || !gateway.isInTree(ownedMp4Uri)) return false
+        val mp4Scope = if (mp4Subfolder == null) gateway
+        else gateway.childDirectoryGateway(mp4Subfolder, create = false) ?: return false
+        if (!gateway.isInTree(audioUri) || !mp4Scope.isInTree(ownedMp4Uri)) return false
         val audioName = gateway.queryDisplayName(audioUri) ?: return false
         val audioStem = audioName.substringBeforeLast('.', "")
         if (audioStem.isBlank() || audioStem == audioName) return false
-        if (gateway.queryDisplayName(ownedMp4Uri) != "$audioStem.mp4") return false
-        return (gateway.documentSize(ownedMp4Uri) ?: -1L) > 0L
+        if (mp4Scope.queryDisplayName(ownedMp4Uri) != "$audioStem.mp4") return false
+        return (mp4Scope.documentSize(ownedMp4Uri) ?: -1L) > 0L
     }
 
     /** Summary text rendered into artifacts; failed-summary notes are excluded. */
@@ -1057,9 +1071,16 @@ object MeetingStorageManager {
             }
 
             val gateway = ContentResolverTreeGateway(context.applicationContext, Uri.parse(snapshot.treeUri))
+            val mp4Gateway = runCatching {
+                if (store.mp4SubfolderEnabled) {
+                    gateway.childDirectoryGateway(MP4_SUBFOLDER, create = true)
+                        ?: error("The recordings folder refused to create the \"$MP4_SUBFOLDER\" subfolder")
+                } else gateway
+            }.getOrElse { e -> return@withContext failure(e.message ?: e.javaClass.simpleName) }
             var currentOwnedMp4Uri = snapshot.ownedMp4Uri
             val outcome = exportMp4ToTree(
                 gateway = gateway,
+                mp4Gateway = mp4Gateway,
                 sessionId = snapshot.sessionId,
                 audioUri = snapshot.ownedAudioUri,
                 ownedMp4Uri = snapshot.ownedMp4Uri,
@@ -1143,6 +1164,8 @@ object MeetingStorageManager {
         ownedSrtUri: String? = null,
         verifySrtStem: Boolean = ownedSrtUri != null,
         desiredStem: String? = null,
+        /** MP4 documents live in this gateway (the tree root or its "mp4" subfolder); audio/SRT use [gateway]. */
+        mp4Gateway: RecordingTreeGateway = gateway,
     ): Mp4PublishOutcome {
         if (!generatedMp4.isFile || generatedMp4.length() <= 0L) {
             return failure("Generated MP4 file is missing or empty.")
@@ -1182,21 +1205,21 @@ object MeetingStorageManager {
 
             val desiredName = "$audioStem.mp4"
             val owned = ownedMp4Uri?.takeIf { it.isNotBlank() }
-            val ownedInTree = owned != null && gateway.isInTree(owned)
-            val ownedName = if (ownedInTree) gateway.queryDisplayName(owned!!) else null
+            val ownedInTree = owned != null && mp4Gateway.isInTree(owned)
+            val ownedName = if (ownedInTree) mp4Gateway.queryDisplayName(owned!!) else null
             val replaceOwned = ownedInTree && ownedName == desiredName
 
             if (!replaceOwned) {
-                val names = gateway.childDocumentNames()
+                val names = mp4Gateway.childDocumentNames()
                 if (desiredName in names) {
                     return failure(
                         "\"$desiredName\" already exists in the recordings folder. " +
                             "Retry the full export so audio, SRT and MP4 get a fresh common name."
                     )
                 }
-                val uri = gateway.createDocument(MIME_MP4, desiredName)
+                val uri = mp4Gateway.createDocument(MIME_MP4, desiredName)
                     .also { created.add(it) }
-                if (!gateway.isInTree(uri) || gateway.queryDisplayName(uri) != desiredName) {
+                if (!mp4Gateway.isInTree(uri) || mp4Gateway.queryDisplayName(uri) != desiredName) {
                     throw java.io.IOException("Provider created an unexpected MP4 name")
                 }
                 writeDocument(gateway, uri) { out ->
@@ -1209,8 +1232,12 @@ object MeetingStorageManager {
                     if (ok) {
                         created.clear()
                         // Folder change: keep a previous tree's MP4 untouched.
-                        // Same tree: delete a superseded old-name MP4 only after commit.
-                        val old = owned?.takeIf { it != uri && ownedInTree }
+                        // Subfolder change: keep another folder's/level's MP4
+                        // untouched; same tree: delete a superseded MP4 only
+                        // after commit.
+                        val old = owned?.takeIf {
+                            it != uri && (mp4Gateway.isInTree(it) || gateway.isInTree(it))
+                        }
                         if (old != null && !gateway.deleteDocument(old)) {
                             cleanupError = "Previous MP4 export could not be cleaned up."
                         }
@@ -1228,7 +1255,7 @@ object MeetingStorageManager {
 
             // Replacement: unique pending document + rename promotion.
             val ownedDoc = owned!!
-            val existingNames = gateway.childDocumentNames()
+            val existingNames = mp4Gateway.childDocumentNames()
             var pendingName = "muesli_mp4_pending_${UUID.randomUUID()}.mp4"
             while (pendingName in existingNames) {
                 pendingName = "muesli_mp4_pending_${UUID.randomUUID()}.mp4"
@@ -1237,9 +1264,9 @@ object MeetingStorageManager {
             while (backupName in existingNames || backupName == pendingName) {
                 backupName = "muesli_mp4_backup_${UUID.randomUUID()}.mp4"
             }
-            val pendingUri = gateway.createDocument(MIME_MP4, pendingName)
+            val pendingUri = mp4Gateway.createDocument(MIME_MP4, pendingName)
                 .also { created.add(it) }
-            if (!gateway.isInTree(pendingUri) || gateway.queryDisplayName(pendingUri) != pendingName) {
+            if (!mp4Gateway.isInTree(pendingUri) || mp4Gateway.queryDisplayName(pendingUri) != pendingName) {
                 throw java.io.IOException("Provider created an unexpected pending MP4 name")
             }
             writeDocument(gateway, pendingUri) { out ->
@@ -1271,10 +1298,10 @@ object MeetingStorageManager {
                             throw java.io.IOException("The exported SRT file changed during MP4 export")
                         }
                     }
-                    if (!gateway.isInTree(ownedDoc) || gateway.queryDisplayName(ownedDoc) != desiredName) {
+                    if (!mp4Gateway.isInTree(ownedDoc) || mp4Gateway.queryDisplayName(ownedDoc) != desiredName) {
                         throw java.io.IOException("The existing MP4 was modified during export")
                     }
-                    if (!gateway.isInTree(pendingUri) || gateway.queryDisplayName(pendingUri) != pendingName) {
+                    if (!mp4Gateway.isInTree(pendingUri) || mp4Gateway.queryDisplayName(pendingUri) != pendingName) {
                         throw java.io.IOException("The pending MP4 document was modified during export")
                     }
 
@@ -1392,11 +1419,11 @@ object MeetingStorageManager {
 class ContentResolverTreeGateway(
     private val context: Context,
     private val treeUri: Uri,
+    private val baseDocId: String = DocumentsContract.getTreeDocumentId(treeUri),
 ) : MeetingStorageManager.RecordingTreeGateway {
 
     private val contentResolver = context.contentResolver
-    private val treeDocId: String = DocumentsContract.getTreeDocumentId(treeUri)
-    private val rootDocUri: Uri = DocumentsContract.buildDocumentUriUsingTree(treeUri, treeDocId)
+    private val baseDocUri: Uri = DocumentsContract.buildDocumentUriUsingTree(treeUri, baseDocId)
 
     private fun query(uri: Uri, column: String): String? = try {
         contentResolver.query(uri, arrayOf(column), null, null, null)?.use { c ->
@@ -1410,9 +1437,9 @@ class ContentResolverTreeGateway(
         val uri = Uri.parse(documentUri)
         val docId = DocumentsContract.getDocumentId(uri)
         val sameTree = !DocumentsContract.isTreeUri(uri) ||
-            DocumentsContract.getTreeDocumentId(uri) == treeDocId
-        val directChild = docId == treeDocId ||
-            (docId.startsWith("$treeDocId/") && !docId.removePrefix("$treeDocId/").contains('/'))
+            DocumentsContract.getTreeDocumentId(uri) == DocumentsContract.getTreeDocumentId(treeUri)
+        val directChild = docId == baseDocId ||
+            (docId.startsWith("$baseDocId/") && !docId.removePrefix("$baseDocId/").contains('/'))
         uri.authority == treeUri.authority && sameTree && directChild
     } catch (_: Exception) {
         false
@@ -1421,7 +1448,7 @@ class ContentResolverTreeGateway(
     override fun childDocumentNames(): Set<String> {
         val names = mutableSetOf<String>()
         val cursor = contentResolver.query(
-            DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, treeDocId),
+            DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, baseDocId),
             arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
             null, null, null
         ) ?: throw java.io.IOException("Could not enumerate the recordings folder")
@@ -1432,7 +1459,7 @@ class ContentResolverTreeGateway(
     }
 
     override fun createDocument(mime: String, displayName: String): String =
-        DocumentsContract.createDocument(contentResolver, rootDocUri, mime, displayName)?.toString()
+        DocumentsContract.createDocument(contentResolver, baseDocUri, mime, displayName)?.toString()
             ?: throw java.io.IOException("The recordings folder refused to create $displayName")
 
     override fun queryDisplayName(documentUri: String): String? =
@@ -1472,6 +1499,38 @@ class ContentResolverTreeGateway(
         )?.use { c -> if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else null }
     } catch (_: Exception) {
         null
+    }
+
+    override fun childDirectoryGateway(
+        name: String,
+        create: Boolean,
+    ): MeetingStorageManager.RecordingTreeGateway? {
+        childDirDocId(name)?.let { return ContentResolverTreeGateway(context, treeUri, it) }
+        if (!create) return null
+        val created = DocumentsContract.createDocument(
+            contentResolver, baseDocUri, DocumentsContract.Document.MIME_TYPE_DIR, name
+        ) ?: throw java.io.IOException("The recordings folder refused to create the $name subfolder")
+        return ContentResolverTreeGateway(context, treeUri, DocumentsContract.getDocumentId(created))
+    }
+
+    private fun childDirDocId(name: String): String? {
+        val children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, baseDocId)
+        contentResolver.query(
+            children,
+            arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+            ),
+            null, null, null,
+        )?.use { c ->
+            while (c.moveToNext()) {
+                if (c.getString(1) == name &&
+                    c.getString(2) == DocumentsContract.Document.MIME_TYPE_DIR
+                ) return c.getString(0)
+            }
+        }
+        return null
     }
 
     override fun renameDocument(documentUri: String, newDisplayName: String): String =

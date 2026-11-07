@@ -78,6 +78,9 @@ fun SettingsTab(store: SharedStore) {
         SettingsSection.APPEARANCE -> SettingsScaffold("Appearance", onBack = { section = null }) {
             AppearanceSettings()
         }
+        SettingsSection.FILES -> SettingsScaffold("Files", onBack = { section = null }) {
+            FilesSettings(store)
+        }
         SettingsSection.ABOUT -> SettingsScaffold("About", onBack = { section = null }) {
             AboutSettings(store)
         }
@@ -90,12 +93,13 @@ private enum class SettingsSection(
     val icon: ImageVector,
 ) {
     VOICE_NOTES("Voice Notes", "Speech engine, mic readiness, and keyboard setup.", Icons.Default.Keyboard),
-    MEETINGS("Meetings", "Default template and audio retention.", Icons.Default.Groups),
+    MEETINGS("Meetings", "Default meeting template.", Icons.Default.Groups),
     SPEAKER_PROFILES("Audio Profiles", "Enroll speaker voiceprints and test voice matching.", Icons.Default.RecordVoiceOver),
     DICTIONARY("Dictionary", "Filler word removal, custom phrases, names, and acronyms.", Icons.Default.Book),
     MODELS("Models", "Choose and download on-device Parakeet models.", Icons.Default.Memory),
     AI_SUMMARIES("AI Summaries", "Meeting summary providers, auth, and model selection.", Icons.Default.AutoAwesome),
     APPEARANCE("Appearance", "Light and dark mode, and app accent.", Icons.Default.Palette),
+    FILES("Files", "Recordings folder, MP4 export location, and backup.", Icons.Default.FolderOpen),
     ABOUT("About", "Version, profile, and open-source acknowledgements.", Icons.Default.Info),
 }
 
@@ -343,11 +347,36 @@ private fun VoiceNotesSettings(store: SharedStore) {
 
 @Composable
 private fun MeetingsSettings(store: SharedStore) {
-    val context = LocalContext.current
     val colors = MuesliTheme.colors
     var defaultTemplate by remember { mutableStateOf(MeetingTemplate.fromId(store.defaultMeetingTemplate)) }
+
+    Column(verticalArrangement = Arrangement.spacedBy(MuesliSpacing.s16)) {
+        SettingsCard {
+            Text("Default Template", color = colors.textPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+            MeetingTemplate.entries.forEach { template ->
+                ChoiceRow(
+                    title = template.label,
+                    subtitle = template.detail,
+                    selected = template == defaultTemplate,
+                    onClick = {
+                        defaultTemplate = template
+                        store.defaultMeetingTemplate = template.id
+                    }
+                )
+            }
+        }
+    }
+}
+
+// ─────────────────────── Files ───────────────────────
+
+@Composable
+private fun FilesSettings(store: SharedStore) {
+    val context = LocalContext.current
+    val colors = MuesliTheme.colors
     var retainAudio by remember { mutableStateOf(store.retainMeetingAudio) }
     var exportMp4 by remember { mutableStateOf(store.exportEmbeddedMp4Enabled) }
+    var mp4Subfolder by remember { mutableStateOf(store.mp4SubfolderEnabled) }
     var speakerLabels by remember { mutableStateOf(store.speakerLabelsEnabled) }
     var folderError by remember { mutableStateOf<String?>(null) }
     var folderRevision by remember { mutableIntStateOf(0) }
@@ -365,21 +394,6 @@ private fun MeetingsSettings(store: SharedStore) {
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(MuesliSpacing.s16)) {
-        SettingsCard {
-            Text("Default Template", color = colors.textPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-            MeetingTemplate.entries.forEach { template ->
-                ChoiceRow(
-                    title = template.label,
-                    subtitle = template.detail,
-                    selected = template == defaultTemplate,
-                    onClick = {
-                        defaultTemplate = template
-                        store.defaultMeetingTemplate = template.id
-                    }
-                )
-            }
-        }
-
         SettingsCard {
             Text("Recording", color = colors.textPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
             ToggleRow(
@@ -401,9 +415,16 @@ private fun MeetingsSettings(store: SharedStore) {
                 onCheckedChange = { exportMp4 = it; store.exportEmbeddedMp4Enabled = it }
             )
 
+            ToggleRow(
+                title = "Store MP4 files in a subfolder",
+                subtitle = "New MP4 exports go into an \"mp4\" folder inside the recordings folder instead of next to the audio. Existing MP4s stay where they are.",
+                checked = mp4Subfolder,
+                onCheckedChange = { mp4Subfolder = it; store.mp4SubfolderEnabled = it }
+            )
+
             Text("Recordings folder", color = colors.textPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
             Text(
-                folderLabel?.let { "Audio (M4A) and SRT files are exported to $it." }
+                folderLabel?.let { "Current folder: $it — audio (M4A) and SRT files are exported there." }
                     ?: "Pick a folder once so finished meetings export their audio and SRT files there. Until then they stay inside the app.",
                 color = colors.textSecondary,
                 fontSize = 11.sp,
@@ -426,7 +447,7 @@ private fun MeetingsSettings(store: SharedStore) {
             Text("Backup & restore", color = colors.textPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
             ToggleRow(
                 title = "Automatic backup",
-                subtitle = "Saves ${AppBackup.FILE_NAME} in the Recordings folder when you leave the app: settings, custom words and voice profiles (not API keys or sign-ins). Other apps with access to that folder can read it.",
+                subtitle = "Saves ${AppBackup.FILE_NAME} in the \"backup\" subfolder of the Recordings folder when you leave the app: settings, custom words and voice profiles (not API keys or sign-ins). Other apps with access to that folder can read it.",
                 checked = autoBackup,
                 onCheckedChange = { autoBackup = it; store.autoBackupEnabled = it }
             )
