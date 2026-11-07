@@ -20,6 +20,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -30,10 +31,12 @@ import com.phequals7.muesli.model.ModelManager
 import com.phequals7.muesli.model.SpeechModelSpec
 import com.phequals7.muesli.model.SpeechModels
 import com.phequals7.muesli.summaries.ChatGptAuthManager
+import com.phequals7.muesli.summaries.SummaryHttp
 import com.phequals7.muesli.theme.MuesliCorners
 import com.phequals7.muesli.theme.MuesliSpacing
 import com.phequals7.muesli.theme.MuesliTheme
 import com.phequals7.muesli.ui.components.MuesliInlineWaveform
+import com.phequals7.muesli.ui.dashboard.settings.SpeechModelCard
 import com.phequals7.muesli.ui.components.MuesliWaveformMode
 import com.phequals7.muesli.utils.CustomWordMatcher
 import com.phequals7.muesli.utils.FillerWordFilter
@@ -516,82 +519,156 @@ private fun SummaryStep(
     val scope = rememberCoroutineScope()
     val authManager = remember { ChatGptAuthManager(context.applicationContext) }
 
+    var backend by remember { mutableStateOf(store.summaryBackend) }
     var signedIn by remember { mutableStateOf(authManager.isAuthenticated) }
     var signInInProgress by remember { mutableStateOf(false) }
     var apiKey by remember { mutableStateOf(store.openRouterApiKey) }
+    var customUrl by remember { mutableStateOf(store.customSummaryUrl) }
+    var customModel by remember { mutableStateOf(store.customSummaryModel) }
+    var customKey by remember { mutableStateOf(store.customSummaryApiKey) }
+    var localModelId by remember { mutableStateOf(SpeechModels.summaryById(store.localSummaryModelId).id) }
+    val modelManager = remember { ModelManager.getInstance(context.applicationContext) }
+    val modelStatuses by modelManager.statuses.collectAsState()
     var statusMessage by remember { mutableStateOf<String?>(null) }
+    val customError = SummaryHttp.customEndpointError(customUrl, customModel)
+    val configured = when (backend) {
+        "chatgpt" -> signedIn
+        "openrouter" -> apiKey.isNotBlank()
+        "custom" -> customError == null
+        "local_qwen" -> modelStatuses[localModelId]?.isInstalled == true
+        else -> false
+    }
 
     OnboardingPage(
         step = OnboardingStep.SUMMARY, stepIndex = stepIndex, stepCount = stepCount,
         subtitle = "Optionally connect a provider to turn meeting transcripts into structured notes. You can do this later in Settings.",
         onBack = onBack,
-        primaryLabel = if (signedIn || apiKey.isNotBlank()) "Finish" else "Finish without summaries",
-        primaryEnabled = !signInInProgress,
+        primaryLabel = "Finish",
+        primaryEnabled = configured && !signInInProgress,
         onPrimary = {
+            store.summaryBackend = backend
             store.openRouterApiKey = apiKey.trim()
-            store.summariesEnabled = signedIn || apiKey.isNotBlank()
+            store.customSummaryUrl = customUrl.trim()
+            store.customSummaryModel = customModel.trim()
+            store.customSummaryApiKey = customKey.trim()
+            store.localSummaryModelId = localModelId
+            store.summariesEnabled = true
             onNext()
         },
+        skipLabel = "Finish without summaries",
+        onSkip = { store.summariesEnabled = false; onNext() },
     ) {
         OnboardingCard {
-            Text("ChatGPT (recommended)", color = colors.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    modifier = Modifier
-                        .size(10.dp)
-                        .clip(CircleShape)
-                        .background(if (signedIn) colors.syncGreen else colors.textTertiary),
-                )
-                Spacer(modifier = Modifier.width(MuesliSpacing.s8))
-                Text(
-                    if (signedIn) "Signed in" else "Not signed in",
-                    color = if (signedIn) colors.syncGreen else colors.textSecondary,
-                    fontSize = 13.sp,
-                    modifier = Modifier.weight(1f),
-                )
-                if (signInInProgress) {
-                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = colors.accent)
-                }
+            listOf(
+                Triple("chatgpt", "ChatGPT", "Sign in with your account"),
+                Triple("openrouter", "OpenRouter", "Bring your own API key"),
+                Triple("custom", "Custom (OpenAI-compatible)", "HTTPS endpoint and model ID"),
+                Triple("local_qwen", "On-device Qwen", "Run summaries privately on this device"),
+            ).forEach { (id, title, detail) ->
+                OnboardingChoiceRow(title, detail, backend == id) { backend = id }
             }
-            if (!signedIn) {
-                Button(
-                    onClick = {
-                        signInInProgress = true
-                        statusMessage = null
-                        scope.launch {
-                            val error = authManager.signIn { intent -> context.startActivity(intent) }
-                            signInInProgress = false
-                            if (error == null) signedIn = true else statusMessage = error
-                        }
-                    },
-                    enabled = !signInInProgress,
-                    colors = ButtonDefaults.buttonColors(containerColor = colors.accent),
-                    shape = RoundedCornerShape(MuesliCorners.medium),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("Sign in with ChatGPT", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+        }
+        if (backend == "chatgpt") {
+            OnboardingCard {
+                Text("ChatGPT (recommended)", color = colors.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(10.dp)
+                            .clip(CircleShape)
+                            .background(if (signedIn) colors.syncGreen else colors.textTertiary),
+                    )
+                    Spacer(modifier = Modifier.width(MuesliSpacing.s8))
+                    Text(
+                        if (signedIn) "Signed in" else "Not signed in",
+                        color = if (signedIn) colors.syncGreen else colors.textSecondary,
+                        fontSize = 13.sp,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (signInInProgress) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = colors.accent)
+                    }
+                }
+                if (!signedIn) {
+                    Button(
+                        onClick = {
+                            signInInProgress = true
+                            statusMessage = null
+                            scope.launch {
+                                val error = authManager.signIn { intent -> context.startActivity(intent) }
+                                signInInProgress = false
+                                if (error == null) signedIn = true else statusMessage = error
+                            }
+                        },
+                        enabled = !signInInProgress,
+                        colors = ButtonDefaults.buttonColors(containerColor = colors.accent),
+                        shape = RoundedCornerShape(MuesliCorners.medium),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("Sign in with ChatGPT", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                    }
                 }
             }
         }
-        OnboardingCard {
-            Text("Or bring an OpenRouter key", color = colors.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-            TextField(
-                value = apiKey,
-                onValueChange = { apiKey = it },
-                placeholder = { Text("sk-or-…", color = colors.textTertiary) },
-                singleLine = true,
-                colors = TextFieldDefaults.colors(
-                    focusedContainerColor = colors.surfacePrimary,
-                    unfocusedContainerColor = colors.surfacePrimary,
-                    focusedTextColor = colors.textPrimary,
-                    unfocusedTextColor = colors.textPrimary,
-                    cursorColor = colors.accent,
-                    focusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent,
-                    unfocusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent,
-                ),
-                shape = RoundedCornerShape(MuesliCorners.medium),
-                modifier = Modifier.fillMaxWidth(),
+        if (backend == "openrouter") {
+            OnboardingCard {
+                Text("Or bring an OpenRouter key", color = colors.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                TextField(
+                    value = apiKey,
+                    onValueChange = { apiKey = it },
+                    placeholder = { Text("sk-or-…", color = colors.textTertiary) },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    colors = TextFieldDefaults.colors(
+                        focusedContainerColor = colors.surfacePrimary,
+                        unfocusedContainerColor = colors.surfacePrimary,
+                        focusedTextColor = colors.textPrimary,
+                        unfocusedTextColor = colors.textPrimary,
+                        cursorColor = colors.accent,
+                        focusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent,
+                        unfocusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent,
+                    ),
+                    shape = RoundedCornerShape(MuesliCorners.medium),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
+        if (backend == "custom") {
+            OnboardingCard {
+                Text("Custom endpoint", color = colors.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                OutlinedTextField(
+                    value = customUrl, onValueChange = { customUrl = it },
+                    label = { Text("Chat-completions URL") },
+                    placeholder = { Text("https://host.example/v1/chat/completions") },
+                    singleLine = true, modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = customModel, onValueChange = { customModel = it },
+                    label = { Text("Model ID") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = customKey, onValueChange = { customKey = it },
+                    label = { Text("API key (optional)") }, singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    customError ?: "The full URL is used as entered. Transcript text and notes are sent to this endpoint.",
+                    color = if (customError != null) colors.destructive else colors.textSecondary,
+                    fontSize = 11.sp,
+                )
+            }
+        }
+        if (backend == "local_qwen") {
+            Text(
+                "Download a model to run summaries on this device without uploading transcripts.",
+                color = colors.textSecondary, fontSize = 12.sp,
             )
+            SpeechModels.summaryModels.forEach { model ->
+                SpeechModelCard(
+                    model = model, selected = model.id == localModelId, selectable = true,
+                    onSelect = { localModelId = model.id },
+                )
+            }
         }
         statusMessage?.let { Text(it, color = colors.destructive, fontSize = 11.sp) }
     }

@@ -52,7 +52,7 @@ The current release is **v2.0.0-alpha**. Install a sideloadable APK from [GitHub
 - **Usage stats** — streak, total words, words-per-minute, and meeting counts computed from local history.
 - **iOS design parity** — the official Muesli app icon, MuesliTheme design tokens, glass-pill navigation, dark/light mode, and Blue/Green/Slate accent themes.
 - **Model catalog** — pick between Parakeet v3 600M (multilingual, transducer; ~670 MB download) and Parakeet 110M (English, CTC; ~126 MB archive download); resumable, cancellable downloads with extraction, progress, and disk-usage display. HuggingFace downloads have a DNS-failure fallback to hf-mirror.com.
-- **Guided onboarding** — Profile → Microphone → Keyboard → Speech Model → Try It → AI Summaries, with steps tailored to your use case. Download a model and save a first test dictation during setup.
+- **Guided onboarding** — Profile → Microphone → Keyboard → Speech Model → Try It → AI Summaries, with steps tailored to your use case. Set up ChatGPT, OpenRouter, a custom HTTPS endpoint, or download an on-device Qwen summary model, or skip summaries.
 - **Local storage first** — voice notes, meetings, and preferences use Room/SQLite and SharedPreferences on device. No Muesli account is required; cloud summary providers are optional.
 
 ---
