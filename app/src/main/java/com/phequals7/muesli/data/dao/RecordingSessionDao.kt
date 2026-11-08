@@ -121,24 +121,6 @@ interface RecordingSessionDao {
         fingerprint: String?
     ): Int
 
-    /**
-     * Rollback/recovery pointer update: when replacing an owned MP4 moved the
-     * previous document to a new provider URI (or retained it under a backup
-     * name after a failed rollback), updates `exportedMp4Uri` and preserves its
-     * prior fingerprint as long as the row still holds [expectedOldMp4Uri],
-     * without clearing `mp4ExportError` or failing if title/SRT/segments moved.
-     */
-    @Query(
-        "UPDATE recording_sessions SET exportedMp4Uri = :mp4Uri, " +
-            "mp4TranscriptFingerprint = :fingerprint " +
-            "WHERE id = :sessionId AND exportedMp4Uri IS :expectedOldMp4Uri"
-    )
-    suspend fun restoreExportedMp4Uri(
-        sessionId: String,
-        expectedOldMp4Uri: String?,
-        mp4Uri: String,
-        fingerprint: String?
-    ): Int
     /** MP4-only failure text; touches neither phase, summary state, nor the
      *  shared audio/SRT export error column. */
     @Query("UPDATE recording_sessions SET mp4ExportError = :message WHERE id = :sessionId")

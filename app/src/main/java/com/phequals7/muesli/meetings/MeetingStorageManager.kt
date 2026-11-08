@@ -560,7 +560,9 @@ object MeetingStorageManager {
                         if (latestSession.mp4ExportError != null) {
                             store.updateMp4ExportError(sessionId, null)
                         }
-                    } else {
+                    } else if (latestSession.exportedMp4Uri.isNullOrBlank()) {
+                        // Automatic exports only ever create the FIRST MP4;
+                        // refreshing an existing one is manual (Regenerate MP4).
                         MeetingMp4ExportService.requestExport(context.applicationContext, sessionId, force = false)
                     }
                 }
@@ -895,6 +897,8 @@ object MeetingStorageManager {
     internal const val MP4_EXPORT_CACHE_DIR_PREFIX = "mp4_export_"
     /** Recordings-folder subfolder for MP4 exports when the user opts in. */
     internal const val MP4_SUBFOLDER = "mp4"
+    /** Prefix of the informational "MP4 saved as <fallback name>" export note. */
+    internal const val MP4_SAVED_NOTE_PREFIX = "MP4 saved as"
 
     /** Everything a muxing run captured under [artifactMutex]; publication
      *  re-validates all of it before anything becomes public. */
@@ -959,9 +963,16 @@ object MeetingStorageManager {
         val audioName = gateway.queryDisplayName(audioUri) ?: return false
         val audioStem = audioName.substringBeforeLast('.', "")
         if (audioStem.isBlank() || audioStem == audioName) return false
-        if (mp4Scope.queryDisplayName(ownedMp4Uri) != "$audioStem.mp4") return false
+        if (!isOwnedMp4Name(audioStem, mp4Scope.queryDisplayName(ownedMp4Uri) ?: return false)) return false
         return (mp4Scope.documentSize(ownedMp4Uri) ?: -1L) > 0L
     }
+
+    /** Owned MP4 export names: `<stem>.mp4`, or the dated fallback
+     *  `<stem>-regenerate-<yyyy-MM-dd_HH-mm-ss>.mp4` written when an
+     *  unowned file already occupies the stem name. */
+    internal fun isOwnedMp4Name(audioStem: String, name: String): Boolean =
+        name == "$audioStem.mp4" ||
+            (name.startsWith("$audioStem-regenerate-") && name.endsWith(".mp4"))
 
     /** Summary text rendered into artifacts; failed-summary notes are excluded. */
     internal fun usableSummaryText(session: RecordingSession): String =
@@ -1077,7 +1088,6 @@ object MeetingStorageManager {
                         ?: error("The recordings folder refused to create the \"$MP4_SUBFOLDER\" subfolder")
                 } else gateway
             }.getOrElse { e -> return@withContext failure(e.message ?: e.javaClass.simpleName) }
-            var currentOwnedMp4Uri = snapshot.ownedMp4Uri
             val outcome = exportMp4ToTree(
                 gateway = gateway,
                 mp4Gateway = mp4Gateway,
@@ -1092,26 +1102,11 @@ object MeetingStorageManager {
                         expectedAudioUri = snapshot.ownedAudioUri,
                         expectedSrtUri = snapshot.ownedSrtUri,
                         expectedTitle = snapshot.sessionTitle,
-                        expectedOldMp4Uri = currentOwnedMp4Uri,
+                        expectedOldMp4Uri = snapshot.ownedMp4Uri,
                         expectedSegments = snapshot.segmentProjection,
                         mp4Uri = mp4Uri,
                         fingerprint = snapshot.fingerprint
                     )
-                },
-                restoreOwnedUri = { restoredUri ->
-                    // Rollback or failed-rollback recovery: point Room at the
-                    // surviving old document URI and retain its old fingerprint.
-                    runCatching {
-                        if (store.restoreExportedMp4Uri(
-                                sessionId = snapshot.sessionId,
-                                expectedOldMp4Uri = currentOwnedMp4Uri,
-                                mp4Uri = restoredUri,
-                                fingerprint = snapshot.ownedMp4Fingerprint
-                            ) == 1
-                        ) {
-                            currentOwnedMp4Uri = restoredUri
-                        }
-                    }.onFailure { Log.w(TAG, "Could not restore the MP4 pointer after rollback", it) }
                 },
                 ownedSrtUri = snapshot.ownedSrtUri,
                 verifySrtStem = true,
@@ -1141,17 +1136,12 @@ object MeetingStorageManager {
 
     /**
      * Pure SAF publication of a verified cache MP4 beside the committed
-     * audio document. First export creates the exact final name (deleted
-     * again on any pre-commit failure). Replacements write a uniquely named
-     * pending document, reopen-verify its byte count, then promote it in a
-     * short non-cancellable section: rename the old owned document to a
-     * unique backup, rename the pending document to the final name, commit
-     * through the guarded [commitUri], and only then delete the backup. A
-     * failed promotion removes only the new output and restores the old
-     * name/pointer; if the rollback itself fails the backup survives and its
-     * URI is stored and reported for recovery. An unowned file squatting on
-     * the final name fails safely — retrying the full audio/SRT sync
-     * allocates a new common stem instead of suffixing just the MP4.
+     * audio document. The first export creates the exact stem name; every
+     * export of a meeting that already owns an MP4 (and any export whose
+     * stem name is taken by an unowned file) instead writes a new dated
+     * `<stem>-regenerate-<timestamp>.mp4` — existing files are never
+     * overwritten or deleted. A failed or rejected export removes only the
+     * new document.
      */
     internal suspend fun exportMp4ToTree(
         gateway: RecordingTreeGateway,
@@ -1160,7 +1150,6 @@ object MeetingStorageManager {
         ownedMp4Uri: String?,
         generatedMp4: File,
         commitUri: suspend (mp4Uri: String) -> Boolean,
-        restoreOwnedUri: suspend (restoredUri: String) -> Unit,
         ownedSrtUri: String? = null,
         verifySrtStem: Boolean = ownedSrtUri != null,
         desiredStem: String? = null,
@@ -1204,196 +1193,47 @@ object MeetingStorageManager {
             }
 
             val desiredName = "$audioStem.mp4"
-            val owned = ownedMp4Uri?.takeIf { it.isNotBlank() }
-            val ownedInTree = owned != null && mp4Gateway.isInTree(owned)
-            val ownedName = if (ownedInTree) mp4Gateway.queryDisplayName(owned!!) else null
-            val replaceOwned = ownedInTree && ownedName == desiredName
-
-            if (!replaceOwned) {
-                val names = mp4Gateway.childDocumentNames()
-                if (desiredName in names) {
-                    return failure(
-                        "\"$desiredName\" already exists in the recordings folder. " +
-                            "Retry the full export so audio, SRT and MP4 get a fresh common name."
-                    )
-                }
-                val uri = mp4Gateway.createDocument(MIME_MP4, desiredName)
-                    .also { created.add(it) }
-                if (!mp4Gateway.isInTree(uri) || mp4Gateway.queryDisplayName(uri) != desiredName) {
-                    throw java.io.IOException("Provider created an unexpected MP4 name")
-                }
-                writeDocument(gateway, uri) { out ->
-                    generatedMp4.inputStream().use { input -> copyActively(input, out) }
-                }
-                verifyDocumentLength(gateway, uri, generatedMp4.length())
-                var cleanupError: String? = null
-                val committedNow = withContext(NonCancellable) {
-                    val ok = commitUri(uri).also { committed = it }
-                    if (ok) {
-                        created.clear()
-                        // Folder change: keep a previous tree's MP4 untouched.
-                        // Subfolder change: keep another folder's/level's MP4
-                        // untouched; same tree: delete a superseded MP4 only
-                        // after commit.
-                        val old = owned?.takeIf {
-                            it != uri && (mp4Gateway.isInTree(it) || gateway.isInTree(it))
-                        }
-                        if (old != null && !gateway.deleteDocument(old)) {
-                            cleanupError = "Previous MP4 export could not be cleaned up."
-                        }
-                    } else {
-                        created.forEach { runCatching { gateway.deleteDocument(it) } }
-                        created.clear()
-                    }
-                    ok
-                }
-                if (!committedNow) {
-                    return Mp4PublishOutcome(null, stale = true, error = null, recoveryUri = null)
-                }
-                return Mp4PublishOutcome(uri, stale = false, error = cleanupError, recoveryUri = null)
+            val ownedInTree = ownedMp4Uri?.takeIf { it.isNotBlank() }
+                ?.let { mp4Gateway.isInTree(it) } == true
+            val names = mp4Gateway.childDocumentNames().toMutableSet()
+            var targetName = desiredName
+            if (ownedInTree || desiredName in names) {
+                // Versioned export: regenerating never overwrites — each run
+                // writes a new dated file; so does an unowned squatter on
+                // the stem name.
+                val stamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
+                var attempt = 1
+                do {
+                    targetName = "$audioStem-regenerate-$stamp" +
+                        (if (attempt > 1) "-$attempt" else "") + ".mp4"
+                    attempt++
+                } while (targetName in names)
             }
-
-            // Replacement: unique pending document + rename promotion.
-            val ownedDoc = owned!!
-            val existingNames = mp4Gateway.childDocumentNames()
-            var pendingName = "muesli_mp4_pending_${UUID.randomUUID()}.mp4"
-            while (pendingName in existingNames) {
-                pendingName = "muesli_mp4_pending_${UUID.randomUUID()}.mp4"
-            }
-            var backupName = "muesli_mp4_backup_${UUID.randomUUID()}.mp4"
-            while (backupName in existingNames || backupName == pendingName) {
-                backupName = "muesli_mp4_backup_${UUID.randomUUID()}.mp4"
-            }
-            val pendingUri = mp4Gateway.createDocument(MIME_MP4, pendingName)
+            val uri = mp4Gateway.createDocument(MIME_MP4, targetName)
                 .also { created.add(it) }
-            if (!mp4Gateway.isInTree(pendingUri) || mp4Gateway.queryDisplayName(pendingUri) != pendingName) {
-                throw java.io.IOException("Provider created an unexpected pending MP4 name")
+            if (!mp4Gateway.isInTree(uri) || mp4Gateway.queryDisplayName(uri) != targetName) {
+                throw java.io.IOException("Provider created an unexpected MP4 name")
             }
-            writeDocument(gateway, pendingUri) { out ->
+            writeDocument(mp4Gateway, uri) { out ->
                 generatedMp4.inputStream().use { input -> copyActively(input, out) }
             }
-            verifyDocumentLength(gateway, pendingUri, generatedMp4.length())
-
-            var backupUri: String? = null
-            var backupDisplayName: String = backupName
-            var finalUri: String? = null
-            var stale = false
-            var error: String? = null
-            var recoveryUri: String? = null
-            var cleanupError: String? = null
-            withContext(NonCancellable) {
-                var rollbackNeeded = false
-                try {
-                    // Ownership and sibling stem may have changed while writing ran.
-                    if (!gateway.isInTree(audioUri) ||
-                        gateway.queryDisplayName(audioUri)?.substringBeforeLast('.', "") != audioStem
-                    ) {
-                        throw java.io.IOException("The exported audio file changed during MP4 export")
-                    }
-                    if (verifySrtStem) {
-                        val srtUri = ownedSrtUri?.takeIf { it.isNotBlank() }
-                        if (srtUri == null || !gateway.isInTree(srtUri) ||
-                            gateway.queryDisplayName(srtUri) != "$audioStem.srt"
-                        ) {
-                            throw java.io.IOException("The exported SRT file changed during MP4 export")
-                        }
-                    }
-                    if (!mp4Gateway.isInTree(ownedDoc) || mp4Gateway.queryDisplayName(ownedDoc) != desiredName) {
-                        throw java.io.IOException("The existing MP4 was modified during export")
-                    }
-                    if (!mp4Gateway.isInTree(pendingUri) || mp4Gateway.queryDisplayName(pendingUri) != pendingName) {
-                        throw java.io.IOException("The pending MP4 document was modified during export")
-                    }
-
-                    val movedBackupUri = gateway.renameDocument(ownedDoc, backupName)
-                    val movedBackupInTree = gateway.isInTree(movedBackupUri)
-                    val movedBackupName = if (movedBackupInTree) gateway.queryDisplayName(movedBackupUri) else null
-                    if (movedBackupName == desiredName) {
-                        if (movedBackupInTree && movedBackupUri != ownedDoc) {
-                            runCatching { restoreOwnedUri(movedBackupUri) }
-                        }
-                        throw java.io.IOException("The recordings folder refused to move the existing MP4 aside")
-                    }
-                    backupUri = movedBackupUri
-                    if (movedBackupName != null) backupDisplayName = movedBackupName
-                    if (!movedBackupInTree || movedBackupName != backupName) {
-                        throw java.io.IOException("Provider created an unexpected backup MP4 name")
-                    }
-
-                    val promotedUri = gateway.renameDocument(pendingUri, desiredName)
-                    finalUri = promotedUri
-                    created.remove(pendingUri)
-                    created.add(promotedUri)
-                    if (!gateway.isInTree(promotedUri) || gateway.queryDisplayName(promotedUri) != desiredName) {
-                        throw java.io.IOException("Provider created an unexpected MP4 name")
-                    }
-
-                    if (!commitUri(promotedUri)) {
-                        stale = true
-                        rollbackNeeded = true
-                    } else {
-                        committed = true
-                        created.clear()
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "MP4 promotion failed for $sessionId", e)
-                    error = e.message ?: e.javaClass.simpleName
-                    rollbackNeeded = true
-                }
-                if (rollbackNeeded) {
-                    // Remove only the newly created output first so desiredName is
-                    // free and no pending copy remains even if backup restore fails.
-                    val newDoc = finalUri ?: pendingUri
-                    var removedNew = runCatching { gateway.deleteDocument(newDoc) }.getOrDefault(false)
-                    if (!removedNew && finalUri != null) {
-                        val demoted = runCatching { gateway.renameDocument(finalUri!!, pendingName) }.getOrNull()
-                        if (demoted != null) {
-                            removedNew = runCatching { gateway.deleteDocument(demoted) }.getOrDefault(false)
-                        }
-                    }
+            verifyDocumentLength(mp4Gateway, uri, generatedMp4.length())
+            val note = if (targetName != desiredName) {
+                "$MP4_SAVED_NOTE_PREFIX \"$targetName\"."
+            } else null
+            val committedNow = withContext(NonCancellable) {
+                val ok = commitUri(uri).also { committed = it }
+                if (ok) created.clear()
+                else {
+                    created.forEach { runCatching { mp4Gateway.deleteDocument(it) } }
                     created.clear()
-
-                    // Restore the surviving backup by name and Room pointer.
-                    if (backupUri != null) {
-                        var currentBackupUri = backupUri!!
-                        try {
-                            if (!removedNew && gateway.queryDisplayName(newDoc) == desiredName) {
-                                throw java.io.IOException("Could not free \"$desiredName\" to restore the previous MP4")
-                            }
-                            val restoredUri = gateway.renameDocument(currentBackupUri, desiredName)
-                            if (gateway.isInTree(restoredUri)) {
-                                currentBackupUri = restoredUri
-                            }
-                            if (!gateway.isInTree(restoredUri) ||
-                                gateway.queryDisplayName(restoredUri) != desiredName
-                            ) {
-                                throw java.io.IOException("Provider did not restore the previous MP4 name")
-                            }
-                            restoreOwnedUri(restoredUri)
-                        } catch (rollback: Exception) {
-                            Log.e(TAG, "MP4 promotion rollback failed for $sessionId", rollback)
-                            recoveryUri = currentBackupUri
-                            runCatching { restoreOwnedUri(currentBackupUri) }
-                            val survivingName = runCatching { gateway.queryDisplayName(currentBackupUri) }
-                                .getOrNull() ?: backupDisplayName
-                            val reason = error ?: if (stale) "meeting changed during export" else {
-                                rollback.message ?: rollback.javaClass.simpleName
-                            }
-                            stale = false
-                            error = "MP4 replacement failed ($reason) and the previous copy is kept " +
-                                "as \"$survivingName\" in the recordings folder. It is safe to retry."
-                        }
-                    }
-                } else {
-                    // Committed: the backup is now redundant.
-                    if (backupUri != null && !gateway.deleteDocument(backupUri!!)) {
-                        cleanupError = "Previous MP4 export could not be cleaned up."
-                    }
                 }
+                ok
             }
-            if (stale && error == null) return Mp4PublishOutcome(null, stale = true, error = null, recoveryUri = null)
-            if (error != null) return Mp4PublishOutcome(null, stale = false, error = error, recoveryUri = recoveryUri)
-            return Mp4PublishOutcome(finalUri, stale = false, error = cleanupError, recoveryUri = null)
+            if (!committedNow) {
+                return Mp4PublishOutcome(null, stale = true, error = null, recoveryUri = null)
+            }
+            return Mp4PublishOutcome(uri, stale = false, error = note, recoveryUri = null)
         } catch (e: CancellationException) {
             if (!committed) created.forEach { runCatching { gateway.deleteDocument(it) } }
             throw e

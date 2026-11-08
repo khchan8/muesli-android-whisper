@@ -362,14 +362,6 @@ class SharedStore(private val context: Context) {
         sessionId, expectedAudioPath, expectedAudioUri, expectedSrtUri,
         expectedTitle, expectedOldMp4Uri, mp4Uri, fingerprint
     )
-    suspend fun restoreExportedMp4Uri(
-        sessionId: String,
-        expectedOldMp4Uri: String?,
-        mp4Uri: String,
-        fingerprint: String?
-    ): Int = recordingSessionDao.restoreExportedMp4Uri(
-        sessionId, expectedOldMp4Uri, mp4Uri, fingerprint
-    )
 
     suspend fun updateMp4ExportError(sessionId: String, message: String?): Int =
         recordingSessionDao.updateMp4ExportError(sessionId, message)

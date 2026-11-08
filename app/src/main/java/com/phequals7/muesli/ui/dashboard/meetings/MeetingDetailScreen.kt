@@ -201,6 +201,14 @@ fun MeetingDetailScreen(
         }
     }
 
+    // The "MP4 saved as …" note is one-shot information about the last
+    // export; it must not survive leaving and re-entering this screen.
+    LaunchedEffect(meeting.id) {
+        if (meeting.mp4ExportError?.startsWith(MeetingStorageManager.MP4_SAVED_NOTE_PREFIX) == true) {
+            store.updateMp4ExportError(meeting.id, null)
+        }
+    }
+
     // Lazily materialize the SRT sidecar / normalize names for already
     // completed recordings when detail is opened (once per id/path/title).
     LaunchedEffect(meeting.id, meeting.audioFileName, meeting.title) {
@@ -690,7 +698,20 @@ private fun MeetingDetailContent(
                     TextButton(onClick = onCancelMp4Export) { Text("Cancel") }
                 }
             }
-            if (mp4ExportError != null && mp4Progress == null) {
+            val mp4SavedNote = mp4ExportError?.takeIf {
+                it.startsWith(MeetingStorageManager.MP4_SAVED_NOTE_PREFIX)
+            }
+            if (mp4SavedNote != null && mp4Progress == null) {
+                // Successful fallback export: informational only, no retry.
+                Text(
+                    mp4SavedNote,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 4.dp)
+                )
+            } else if (mp4ExportError != null && mp4Progress == null) {
                 Text(
                     mp4ExportError,
                     color = MaterialTheme.colorScheme.error,

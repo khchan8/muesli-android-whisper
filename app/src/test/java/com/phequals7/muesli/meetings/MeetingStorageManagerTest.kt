@@ -881,7 +881,6 @@ class MeetingStorageManagerTest {
         val outcome = MeetingStorageManager.exportMp4ToTree(
             gateway, "s23", audioUri, ownedMp4Uri = null, generatedMp4 = gen,
             commitUri = { uri -> committed = uri; true },
-            restoreOwnedUri = { error("restore must not run on success") }
         )
         assertNull(outcome.error)
         assertFalse(outcome.stale)
@@ -891,51 +890,97 @@ class MeetingStorageManagerTest {
     }
 
     @Test
-    fun `first mp4 export fails safely on an unowned collision`() = runTest {
+    fun `first mp4 export writes a dated fallback when an unowned file squats on the stem`() = runTest {
         val dir = tempFolder.newFolder("mp4coll")
         val stem = "Coll_2026-11-06_14-30-00-000"
         val gateway = FakeTreeGateway()
         val audioUri = gateway.createDocument("audio/mp4", "$stem.m4a")
         val squatter = gateway.createDocument("video/mp4", "$stem.mp4")
         val before = gateway.contents[squatter]!!.copyOf()
+        val gen = generatedMp4(dir, 64)
 
         val outcome = MeetingStorageManager.exportMp4ToTree(
-            gateway, "s24", audioUri, ownedMp4Uri = null, generatedMp4 = generatedMp4(dir, 64),
+            gateway, "s24", audioUri, ownedMp4Uri = null, generatedMp4 = gen,
             commitUri = { true },
-            restoreOwnedUri = { }
         )
-        assertNull(outcome.publishedUri)
-        assertTrue(outcome.error!!.contains("Retry the full export"))
+        val name = gateway.queryDisplayName(outcome.publishedUri!!)
+        assertTrue("expected a dated fallback name, got $name",
+            name!!.startsWith("$stem-regenerate-") && name.endsWith(".mp4"))
+        assertTrue(outcome.error!!.startsWith("MP4 saved as"))
         assertArrayEquals("The squatter must stay untouched", before, gateway.contents[squatter])
-        assertEquals(setOf("$stem.m4a", "$stem.mp4"), gateway.childDocumentNames())
+        assertArrayEquals(gen.readBytes(), gateway.contents[outcome.publishedUri])
+
+        // Repeated exports accumulate distinct dated files (no cleanup, no overwrite).
+        val second = MeetingStorageManager.exportMp4ToTree(
+            gateway, "s24", audioUri, ownedMp4Uri = outcome.publishedUri, generatedMp4 = gen,
+            commitUri = { true },
+        )
+        val secondName = gateway.queryDisplayName(second.publishedUri!!)
+        assertTrue("expected another dated fallback, got $secondName",
+            secondName != name && secondName!!.startsWith("$stem-regenerate-"))
+        assertTrue("the previous fallback file must be kept", outcome.publishedUri in gateway.contents)
+        assertArrayEquals("The squatter must still stay untouched", before, gateway.contents[squatter])
     }
 
     @Test
-    fun `mp4 replacement promotes a pending document and deletes the backup`() = runTest {
+    fun `mp4 regenerate inside the subfolder gateway writes a dated version and keeps the old`() = runTest {
+        val dir = tempFolder.newFolder("mp4subrepl")
+        val stem = "SubRepl_2026-11-08_11-00-00-000"
+        val root = FakeTreeGateway()
+        val audioUri = root.createDocument("audio/mp4", "$stem.m4a")
+        val srtUri = root.createDocument("application/x-subrip", "$stem.srt")
+        val mp4Dir = FakeTreeGateway("tree://mp4/")
+        val owned = mp4Dir.createDocument("video/mp4", "$stem.mp4")
+        mp4Dir.openOutput(owned).use { it.write(ByteArray(16) { 9 }); it.flush() }
+        val gen = generatedMp4(dir, 96)
+
+        var committed: String? = null
+        val outcome = MeetingStorageManager.exportMp4ToTree(
+            root, "s38", audioUri, ownedMp4Uri = owned, generatedMp4 = gen,
+            mp4Gateway = mp4Dir,
+            commitUri = { uri -> committed = uri; true },
+            ownedSrtUri = srtUri,
+            verifySrtStem = true,
+            desiredStem = stem,
+        )
+
+        assertTrue(outcome.error!!.startsWith("MP4 saved as"))
+        assertFalse(outcome.stale)
+        val name = mp4Dir.queryDisplayName(committed!!)
+        assertTrue("expected a dated version in the subfolder, got $name",
+            name!!.startsWith("$stem-regenerate-") && name.endsWith(".mp4"))
+        assertArrayEquals(gen.readBytes(), mp4Dir.contents[committed])
+        assertEquals("The previous version must be kept", "$stem.mp4", mp4Dir.names[owned])
+    }
+
+    @Test
+    fun `regenerating an owned mp4 writes a new dated version and keeps the old file`() = runTest {
         val dir = tempFolder.newFolder("mp4repl")
         val stem = "Repl_2026-11-06_14-30-00-000"
         val gateway = FakeTreeGateway()
         val audioUri = gateway.createDocument("audio/mp4", "$stem.m4a")
         val owned = gateway.createDocument("video/mp4", "$stem.mp4")
-        gateway.openOutput(owned).use { it.write(ByteArray(32) { 7 }); it.flush() }
+        val oldBytes = ByteArray(32) { 7 }
+        gateway.openOutput(owned).use { it.write(oldBytes); it.flush() }
         val gen = generatedMp4(dir, 256)
 
         var committed: String? = null
         val outcome = MeetingStorageManager.exportMp4ToTree(
             gateway, "s25", audioUri, ownedMp4Uri = owned, generatedMp4 = gen,
-            commitUri = { uri -> committed = uri; true },
-            restoreOwnedUri = { error("restore must not run on success") }
+            commitUri = { uri -> committed = uri; true }
         )
-        assertNull(outcome.error)
+        assertTrue(outcome.error!!.startsWith("MP4 saved as"))
         assertFalse(outcome.stale)
-        assertEquals("$stem.mp4", gateway.names[outcome.publishedUri])
-        assertArrayEquals(gen.readBytes(), gateway.contents[outcome.publishedUri])
-        assertTrue("Backup must be deleted after the commit", owned in gateway.deleted)
-        assertEquals(setOf("$stem.m4a", "$stem.mp4"), gateway.childDocumentNames())
+        val name = gateway.names[committed]
+        assertTrue("expected a dated version, got $name",
+            name!!.startsWith("$stem-regenerate-") && name.endsWith(".mp4"))
+        assertArrayEquals(gen.readBytes(), gateway.contents[committed])
+        assertArrayEquals("The old file survives untouched", oldBytes, gateway.contents[owned])
+        assertEquals(3, gateway.childDocumentNames().size)
     }
 
     @Test
-    fun `rejected commit rolls the replacement back to the old mp4`() = runTest {
+    fun `rejected commit removes only the dated candidate and keeps the old mp4`() = runTest {
         val dir = tempFolder.newFolder("mp4stale")
         val stem = "Stale_2026-11-06_14-30-00-000"
         val gateway = FakeTreeGateway()
@@ -944,94 +989,21 @@ class MeetingStorageManagerTest {
         val oldBytes = ByteArray(24) { 9 }
         gateway.openOutput(owned).use { it.write(oldBytes); it.flush() }
 
-        var restored: String? = null
         val outcome = MeetingStorageManager.exportMp4ToTree(
             gateway, "s26", audioUri, ownedMp4Uri = owned, generatedMp4 = generatedMp4(dir, 128),
-            commitUri = { false },
-            restoreOwnedUri = { uri -> restored = uri }
+            commitUri = { false }
         )
         assertTrue(outcome.stale)
         assertNull(outcome.error)
         assertNull(outcome.publishedUri)
-        assertEquals("Old export keeps the final name", "$stem.mp4", gateway.names[restored ?: owned])
-        assertArrayEquals("Old bytes survive untouched", oldBytes, gateway.contents[restored ?: owned])
+        assertEquals("Old export keeps the final name", "$stem.mp4", gateway.names[owned])
+        assertArrayEquals("Old bytes survive untouched", oldBytes, gateway.contents[owned])
         assertEquals(setOf("$stem.m4a", "$stem.mp4"), gateway.childDocumentNames())
     }
 
-    @Test
-    fun `rename refusal fails the replacement without touching the old mp4`() = runTest {
-        val dir = tempFolder.newFolder("mp4refuse")
-        val stem = "Refuse_2026-11-06_14-30-00-000"
-        val gateway = FakeTreeGateway()
-        val audioUri = gateway.createDocument("audio/mp4", "$stem.m4a")
-        val owned = gateway.createDocument("video/mp4", "$stem.mp4")
-        val oldBytes = ByteArray(16) { 11 }
-        gateway.openOutput(owned).use { it.write(oldBytes); it.flush() }
-        gateway.refuseRenameFor.add("$stem.mp4")
-
-        val outcome = MeetingStorageManager.exportMp4ToTree(
-            gateway, "s27", audioUri, ownedMp4Uri = owned, generatedMp4 = generatedMp4(dir, 64),
-            commitUri = { true },
-            restoreOwnedUri = { }
-        )
-        assertNull(outcome.publishedUri)
-        assertFalse(outcome.stale)
-        assertTrue(outcome.error!!.contains("refused"))
-        assertEquals("$stem.mp4", gateway.names[owned])
-        assertArrayEquals(oldBytes, gateway.contents[owned])
-        assertEquals(setOf("$stem.m4a", "$stem.mp4"), gateway.childDocumentNames())
-    }
 
     @Test
-    fun `failed rollback removes pending candidate retains backup and restores recovery pointer`() = runTest {
-        val dir = tempFolder.newFolder("mp4rollback")
-        val stem = "Roll_2026-11-06_14-30-00-000"
-        val gateway = FakeTreeGateway().apply { renameReturnsNewUri = true }
-        val audioUri = gateway.createDocument("audio/mp4", "$stem.m4a")
-        val owned = gateway.createDocument("video/mp4", "$stem.mp4")
-        val oldBytes = ByteArray(16) { 13 }
-        gateway.openOutput(owned).use { it.write(oldBytes); it.flush() }
-        // Moving the owned MP4 aside works (assigning a new backup URI); restoring is refused.
-        gateway.refuseBackupRestore = true
-
-        var recoveryPointer: String? = null
-        val outcome = MeetingStorageManager.exportMp4ToTree(
-            gateway, "s28", audioUri, ownedMp4Uri = owned, generatedMp4 = generatedMp4(dir, 64),
-            commitUri = { false },
-            restoreOwnedUri = { uri -> recoveryPointer = uri }
-        )
-        assertNull(outcome.publishedUri)
-        assertFalse(outcome.stale)
-        assertNotNull("The surviving backup URI must be reported", outcome.recoveryUri)
-        assertEquals("Room pointer must be updated to the surviving backup URI", outcome.recoveryUri, recoveryPointer)
-        assertTrue(outcome.error!!.contains("kept"))
-        assertFalse("Error message must never format a literal null reason", outcome.error!!.contains("(null)"))
-        assertArrayEquals("Old export bytes survive in the backup", oldBytes, gateway.contents[outcome.recoveryUri])
-        val backupName = gateway.names[outcome.recoveryUri]!!
-        assertTrue("The backup keeps its aside name for recovery", backupName.startsWith("muesli_mp4_backup_"))
-        assertEquals(
-            "Failed new/pending MP4 must be removed so only audio and backup remain",
-            setOf("$stem.m4a", backupName),
-            gateway.childDocumentNames()
-        )
-
-        // Subsequent retry using the stored recovery pointer publishes the final name and cleans up the backup.
-        gateway.refuseBackupRestore = false
-        val retryGen = generatedMp4(dir, 96)
-        var retryCommitted: String? = null
-        val retried = MeetingStorageManager.exportMp4ToTree(
-            gateway, "s28", audioUri, ownedMp4Uri = recoveryPointer, generatedMp4 = retryGen,
-            commitUri = { uri -> retryCommitted = uri; true },
-            restoreOwnedUri = { error("restore must not run on successful retry") }
-        )
-        assertNull(retried.error)
-        assertEquals("$stem.mp4", gateway.names[retryCommitted])
-        assertArrayEquals(retryGen.readBytes(), gateway.contents[retryCommitted])
-        assertEquals(setOf("$stem.m4a", "$stem.mp4"), gateway.childDocumentNames())
-    }
-
-    @Test
-    fun `mp4 write verification failure removes only the pending document`() = runTest {
+    fun `mp4 write verification failure removes only the new document`() = runTest {
         val dir = tempFolder.newFolder("mp4short")
         val stem = "Short_2026-11-06_14-30-00-000"
         val gateway = FakeTreeGateway()
@@ -1043,7 +1015,6 @@ class MeetingStorageManagerTest {
         val outcome = MeetingStorageManager.exportMp4ToTree(
             gateway, "s29", audioUri, ownedMp4Uri = owned, generatedMp4 = generatedMp4(dir, 96),
             commitUri = { true },
-            restoreOwnedUri = { }
         )
         assertNull(outcome.publishedUri)
         assertTrue(outcome.error != null)
@@ -1099,7 +1070,6 @@ class MeetingStorageManagerTest {
             ownedMp4Uri = null,
             generatedMp4 = genMp4,
             commitUri = { uri -> mp4Uri = uri; true },
-            restoreOwnedUri = { error("unexpected rollback") },
             ownedSrtUri = srtUri,
             verifySrtStem = true,
             desiredStem = stem,
@@ -1114,64 +1084,7 @@ class MeetingStorageManagerTest {
     }
 
     @Test
-    fun `mp4 replacement and rollback handle providers that return a new URI on rename`() = runTest {
-        val dir = tempFolder.newFolder("mp4newuri")
-        val stem = "NewUri_2026-11-06_14-30-00-000"
-        val gateway = FakeTreeGateway().apply { renameReturnsNewUri = true }
-        val audioUri = gateway.createDocument("audio/mp4", "$stem.m4a")
-        val initialOwned = gateway.createDocument("video/mp4", "$stem.mp4")
-        val oldBytes = ByteArray(32) { 0x44 }
-        gateway.openOutput(initialOwned).use { it.write(oldBytes); it.flush() }
-
-        // 1. Rejected commit with renameReturnsNewUri=true must pass the new restored URI back.
-        var restoredUri: String? = null
-        val rejected = MeetingStorageManager.exportMp4ToTree(
-            gateway, "s30", audioUri, ownedMp4Uri = initialOwned, generatedMp4 = generatedMp4(dir, 100),
-            commitUri = { false },
-            restoreOwnedUri = { uri -> restoredUri = uri }
-        )
-        assertTrue(rejected.stale)
-        assertNull(rejected.error)
-        assertNotNull("New URI from rename-back must be reported to restoreOwnedUri", restoredUri)
-        assertTrue(restoredUri != initialOwned)
-        assertEquals("$stem.mp4", gateway.names[restoredUri])
-        assertArrayEquals(oldBytes, gateway.contents[restoredUri])
-        assertEquals(setOf("$stem.m4a", "$stem.mp4"), gateway.childDocumentNames())
-
-        // 2. Promotion failure after moving backup aside also restores the backup and updates the URI.
-        gateway.refusePendingPromotion = true
-        var restoredAfterFail: String? = null
-        val failedPromo = MeetingStorageManager.exportMp4ToTree(
-            gateway, "s30", audioUri, ownedMp4Uri = restoredUri, generatedMp4 = generatedMp4(dir, 100),
-            commitUri = { true },
-            restoreOwnedUri = { uri -> restoredAfterFail = uri }
-        )
-        assertNull(failedPromo.publishedUri)
-        assertFalse(failedPromo.stale)
-        assertTrue(failedPromo.error!!.contains("refused to promote"))
-        assertNotNull(restoredAfterFail)
-        assertEquals("$stem.mp4", gateway.names[restoredAfterFail])
-        assertArrayEquals(oldBytes, gateway.contents[restoredAfterFail])
-        assertEquals(setOf("$stem.m4a", "$stem.mp4"), gateway.childDocumentNames())
-
-        // 3. Successful replacement with renameReturnsNewUri=true commits the new URI and deletes backup.
-        gateway.refusePendingPromotion = false
-        val newGen = generatedMp4(dir, 144)
-        var committedUri: String? = null
-        val succeeded = MeetingStorageManager.exportMp4ToTree(
-            gateway, "s30", audioUri, ownedMp4Uri = restoredAfterFail, generatedMp4 = newGen,
-            commitUri = { uri -> committedUri = uri; true },
-            restoreOwnedUri = { error("unexpected rollback") }
-        )
-        assertNull(succeeded.error)
-        assertEquals(committedUri, succeeded.publishedUri)
-        assertEquals("$stem.mp4", gateway.names[committedUri])
-        assertArrayEquals(newGen.readBytes(), gateway.contents[committedUri])
-        assertEquals(setOf("$stem.m4a", "$stem.mp4"), gateway.childDocumentNames())
-    }
-
-    @Test
-    fun `short copy permission denial and silent rename no-op preserve prior mp4 exports`() = runTest {
+    fun `short copy and permission denial preserve prior mp4 exports`() = runTest {
         val dir = tempFolder.newFolder("mp4guards")
         val stem = "Guard_2026-11-06_14-30-00-000"
         val gateway = FakeTreeGateway()
@@ -1180,12 +1093,11 @@ class MeetingStorageManagerTest {
         val oldBytes = ByteArray(28) { 0x5A }
         gateway.openOutput(owned).use { it.write(oldBytes); it.flush() }
 
-        // Short copy on replacement: pending document is removed, prior MP4 untouched.
+        // Short copy: the dated candidate is removed, the prior MP4 untouched.
         gateway.truncateWriteToBytes = 12
         val shortCopy = MeetingStorageManager.exportMp4ToTree(
             gateway, "s31", audioUri, ownedMp4Uri = owned, generatedMp4 = generatedMp4(dir, 80),
             commitUri = { true },
-            restoreOwnedUri = { }
         )
         assertNull(shortCopy.publishedUri)
         assertTrue(shortCopy.error!!.contains("length mismatch"))
@@ -1193,27 +1105,12 @@ class MeetingStorageManagerTest {
         assertEquals(setOf("$stem.m4a", "$stem.mp4"), gateway.childDocumentNames())
         gateway.truncateWriteToBytes = null
 
-        // Silent rename refusal (provider returns URI without moving existing MP4 aside).
-        gateway.ignoreRenameFor.add("$stem.mp4")
-        val silentNoOp = MeetingStorageManager.exportMp4ToTree(
-            gateway, "s31", audioUri, ownedMp4Uri = owned, generatedMp4 = generatedMp4(dir, 80),
-            commitUri = { true },
-            restoreOwnedUri = { }
-        )
-        assertNull(silentNoOp.publishedUri)
-        assertNull("Old file was never moved aside, so no backup recovery is needed", silentNoOp.recoveryUri)
-        assertTrue(silentNoOp.error!!.contains("refused to move"))
-        assertEquals("$stem.mp4", gateway.names[owned])
-        assertArrayEquals(oldBytes, gateway.contents[owned])
-        assertEquals(setOf("$stem.m4a", "$stem.mp4"), gateway.childDocumentNames())
-        gateway.ignoreRenameFor.clear()
 
         // Permission denial fails safely without throwing out of exportMp4ToTree.
         gateway.throwPermissionDenied = true
         val denied = MeetingStorageManager.exportMp4ToTree(
             gateway, "s31", audioUri, ownedMp4Uri = owned, generatedMp4 = generatedMp4(dir, 80),
             commitUri = { true },
-            restoreOwnedUri = { }
         )
         assertNull(denied.publishedUri)
         assertTrue(denied.error!!.contains("Permission denied"))
@@ -1234,7 +1131,8 @@ class MeetingStorageManagerTest {
         val newAudio = newGateway.createDocument("audio/mp4", "$stem.m4a")
         val newSrt = newGateway.createDocument("application/x-subrip", "$stem.srt")
         // Unowned squatter in the new folder with the same name: oldMp4 URI from
-        // the previous folder must NEVER grant authority to replace it.
+        // the previous folder must never grant authority to replace it; a dated
+        // fallback is written instead.
         val squatter = newGateway.createDocument("video/mp4", "$stem.mp4")
         val squatterBytes = ByteArray(10) { 0x77 }
         newGateway.openOutput(squatter).use { it.write(squatterBytes); it.flush() }
@@ -1246,13 +1144,13 @@ class MeetingStorageManagerTest {
             ownedMp4Uri = oldMp4,
             generatedMp4 = generatedMp4(dir, 64),
             commitUri = { true },
-            restoreOwnedUri = { },
             ownedSrtUri = newSrt,
             verifySrtStem = true,
             desiredStem = stem,
         )
-        assertNull(blocked.publishedUri)
-        assertTrue(blocked.error!!.contains("already exists"))
+        val fallbackName = newGateway.queryDisplayName(blocked.publishedUri!!)
+        assertTrue("expected a dated fallback in the new folder, got $fallbackName",
+            fallbackName!!.startsWith("$stem-regenerate-"))
         assertArrayEquals("Squatter in new folder must stay untouched", squatterBytes, newGateway.contents[squatter])
         assertArrayEquals("Old folder MP4 must stay untouched", oldBytes, oldGateway.contents[oldMp4])
 
@@ -1267,7 +1165,6 @@ class MeetingStorageManagerTest {
             ownedMp4Uri = oldMp4,
             generatedMp4 = gen,
             commitUri = { true },
-            restoreOwnedUri = { },
             ownedSrtUri = newSrt,
             verifySrtStem = true,
             desiredStem = stem,
@@ -1280,7 +1177,7 @@ class MeetingStorageManagerTest {
     }
 
     @Test
-    fun `same-tree title rename deletes superseded old-name mp4 only after new commit succeeds`() = runTest {
+    fun `same-tree title rename writes a dated new-name version and keeps the old mp4`() = runTest {
         val dir = tempFolder.newFolder("mp4rename")
         val oldStem = "Old_Title_2026-11-06_14-30-00-000"
         val newStem = "New_Title_2026-11-06_14-30-00-000"
@@ -1300,7 +1197,6 @@ class MeetingStorageManagerTest {
             ownedMp4Uri = oldMp4,
             generatedMp4 = gen,
             commitUri = { false },
-            restoreOwnedUri = { },
             ownedSrtUri = newSrt,
             verifySrtStem = true,
             desiredStem = newStem,
@@ -1309,7 +1205,8 @@ class MeetingStorageManagerTest {
         assertTrue("Old-name MP4 survives when commit rejects", oldMp4 in gateway.names)
         assertEquals(setOf("$oldStem.mp4", "$newStem.m4a", "$newStem.srt"), gateway.childDocumentNames())
 
-        // Accepted commit publishes the new-name MP4 and removes the superseded old-name MP4.
+        // Accepted commit publishes a dated version under the new stem; the
+        // old-name MP4 is kept.
         val accepted = MeetingStorageManager.exportMp4ToTree(
             gateway = gateway,
             sessionId = "s33",
@@ -1317,15 +1214,16 @@ class MeetingStorageManagerTest {
             ownedMp4Uri = oldMp4,
             generatedMp4 = gen,
             commitUri = { true },
-            restoreOwnedUri = { },
             ownedSrtUri = newSrt,
             verifySrtStem = true,
             desiredStem = newStem,
         )
-        assertNull(accepted.error)
-        assertEquals("$newStem.mp4", gateway.names[accepted.publishedUri])
-        assertTrue("Superseded old-name MP4 deleted after commit", oldMp4 in gateway.deleted)
-        assertEquals(setOf("$newStem.m4a", "$newStem.srt", "$newStem.mp4"), gateway.childDocumentNames())
+        val newName = gateway.names[accepted.publishedUri]!!
+        assertTrue("expected a dated version under the new stem, got $newName",
+            newName.startsWith("$newStem-regenerate-") && newName.endsWith(".mp4"))
+        assertTrue(accepted.error!!.startsWith("MP4 saved as"))
+        assertTrue("Old-name MP4 is kept", oldMp4 in gateway.names)
+        assertEquals(setOf("$oldStem.mp4", "$newStem.m4a", "$newStem.srt", newName), gateway.childDocumentNames())
     }
 
     @Test
@@ -1352,14 +1250,13 @@ class MeetingStorageManagerTest {
                     job.cancel()
                     true
                 },
-                restoreOwnedUri = { }
             )
         }
         job.join()
         val uri = committedUri!!
-        assertEquals("$stem.mp4", gateway.names[uri])
+        assertTrue(gateway.names[uri]!!.startsWith("$stem-regenerate-"))
         assertArrayEquals(gen.readBytes(), gateway.contents[uri])
-        assertEquals(setOf("$stem.m4a", "$stem.mp4"), gateway.childDocumentNames())
+        assertEquals(3, gateway.childDocumentNames().size)
     }
 
     @Test
@@ -1486,6 +1383,32 @@ class MeetingStorageManagerTest {
         )
     }
 
+
+
+    @Test
+    fun `canSkipAutomaticMp4Export accepts a dated regenerate fallback name`() {
+        val stem = "Reg_2026-11-08_09-00-00-000"
+        val gateway = FakeTreeGateway()
+        val audioUri = gateway.createDocument("audio/mp4", "$stem.m4a")
+        val mp4Uri = gateway.createDocument("video/mp4", "$stem-regenerate-2026-11-08_10-00-00.mp4")
+        gateway.openOutput(mp4Uri).use { it.write(ByteArray(32) { 1 }); it.flush() }
+
+        assertTrue(
+            "A dated fallback is a valid owned export",
+            MeetingStorageManager.canSkipAutomaticMp4Export(
+                gateway, force = false, audioUri = audioUri, ownedMp4Uri = mp4Uri,
+                ownedMp4Fingerprint = "fp1", currentFingerprint = "fp1"
+            )
+        )
+        val stranger = gateway.createDocument("video/mp4", "other.mp4")
+        assertFalse(
+            "An unrelated name must rebuild",
+            MeetingStorageManager.canSkipAutomaticMp4Export(
+                gateway, force = false, audioUri = audioUri, ownedMp4Uri = stranger,
+                ownedMp4Fingerprint = "fp1", currentFingerprint = "fp1"
+            )
+        )
+    }
     @Test
     fun `canSkipAutomaticMp4Export rebuilds when the mp4 subfolder is missing`() {
         val gateway = FakeTreeGateway()
@@ -1503,7 +1426,7 @@ class MeetingStorageManagerTest {
     }
 
     @Test
-    fun `mp4 subfolder export publishes through the child gateway and removes a superseded root mp4`() = runTest {
+    fun `mp4 subfolder export publishes through the child gateway and keeps the root mp4`() = runTest {
         val dir = tempFolder.newFolder("mp4sub")
         val stem = "Sub_2026-11-06_14-30-00-000"
         val root = FakeTreeGateway()
@@ -1516,14 +1439,13 @@ class MeetingStorageManagerTest {
             root, "s36", audioUri, ownedMp4Uri = oldRootMp4, generatedMp4 = generatedMp4(dir, 64),
             mp4Gateway = mp4Dir,
             commitUri = { uri -> committed = uri; true },
-            restoreOwnedUri = { error("restore must not run on success") }
         )
 
         assertEquals(mp4Dir.queryDisplayName(committed!!), "$stem.mp4")
         assertEquals(committed, outcome.publishedUri)
-        assertEquals(64, root.contents.getValue(committed!!).size.toLong())
-        assertTrue("Superseded root MP4 must be deleted after commit", oldRootMp4 in root.deleted)
-        assertNull(root.names[oldRootMp4])
+        assertEquals(64, mp4Dir.contents.getValue(committed!!).size.toLong())
+        // Versioned exports never delete: the superseded root MP4 stays.
+        assertEquals("$stem.mp4", root.names[oldRootMp4])
     }
 
     // ── MP4: request queue coalescing ────────────────────────────────────
