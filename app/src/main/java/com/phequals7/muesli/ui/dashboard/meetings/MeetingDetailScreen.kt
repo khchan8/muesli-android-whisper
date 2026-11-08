@@ -32,6 +32,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -43,6 +44,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
@@ -77,6 +79,7 @@ import com.phequals7.muesli.data.entity.MeetingTranscriptSegmentEntity
 import com.phequals7.muesli.data.entity.RecordingSession
 import com.phequals7.muesli.meetings.DiarizedTranscriptSegment
 import com.phequals7.muesli.meetings.MeetingStorageManager
+import com.phequals7.muesli.meetings.MeetingTemplate
 import com.phequals7.muesli.meetings.MeetingTranscriptSrt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -258,6 +261,7 @@ fun MeetingDetailScreen(
         manualNotes = notes,
         aiSummary = meeting.summaryText.takeIf { it.isNotBlank() },
         summaryState = meeting.summaryState,
+        templateId = meeting.templateId,
         summaryProgress = summaryProgress,
         mp4Progress = mp4ProgressAll?.takeIf { it.sessionId == meeting.id },
         mp4Queued = meeting.id in mp4QueuedIds,
@@ -275,7 +279,7 @@ fun MeetingDetailScreen(
         transcriptAvailable = transcriptAvailable,
         exportError = folderError ?: meeting.errorMessage?.takeIf { it.startsWith(MeetingStorageManager.EXPORT_ERROR_PREFIX) },
         onNotesChanged = { notes = it },
-        onGenerateSummary = {
+        onGenerateSummary = { templateId ->
             // Save the current draft before dispatch so manual notes are
             // never lost to the summary's own retention step.
             scope.launch {
@@ -283,6 +287,7 @@ fun MeetingDetailScreen(
                     store.updateMeetingNotes(meeting.id, notes)
                     MeetingStorageManager.exportSrtArtifactOnly(context.applicationContext, store, meeting.id)
                 }
+                store.updateSessionTemplate(meeting.id, templateId)
                 com.phequals7.muesli.meetings.MeetingSummaryService.generate(context, meeting.id)
             }
         },
@@ -371,6 +376,7 @@ private fun MeetingDetailContent(
     manualNotes: String,
     aiSummary: String?,
     summaryState: String,
+    templateId: String,
     summaryProgress: com.phequals7.muesli.meetings.SummaryProgress?,
     mp4Progress: com.phequals7.muesli.meetings.Mp4ExportProgress?,
     mp4Queued: Boolean,
@@ -381,7 +387,7 @@ private fun MeetingDetailContent(
     transcriptAvailable: Boolean,
     exportError: String?,
     onNotesChanged: (String) -> Unit,
-    onGenerateSummary: () -> Unit,
+    onGenerateSummary: (templateId: String) -> Unit,
     onCancelSummary: () -> Unit,
     onChooseFolder: () -> Unit,
     onRetryExport: () -> Unit,
@@ -777,6 +783,7 @@ private fun MeetingDetailContent(
                         manualNotes = manualNotes,
                         aiSummary = aiSummary,
                         summaryState = summaryState,
+                        templateId = templateId,
                         summaryProgress = summaryProgress,
                         transcriptAvailable = transcriptAvailable,
                         onNotesChanged = onNotesChanged,
@@ -907,15 +914,19 @@ private fun SummaryTab(
     manualNotes: String,
     aiSummary: String?,
     summaryState: String,
+    templateId: String,
     summaryProgress: com.phequals7.muesli.meetings.SummaryProgress?,
     transcriptAvailable: Boolean,
     onNotesChanged: (String) -> Unit,
-    onGenerateSummary: () -> Unit,
+    onGenerateSummary: (templateId: String) -> Unit,
     onCancelSummary: () -> Unit
 ) {
     val activeHere = summaryProgress?.sessionId == meetingId
     val anotherSummary = summaryProgress != null && !activeHere
     val recordingBusy = com.phequals7.muesli.meetings.MeetingRecordingController.isActive
+    val regenerate = summaryState == "completed" && !aiSummary.isNullOrBlank()
+    var summaryDialogOpen by remember { mutableStateOf(false) }
+    var pickedTemplate by remember { mutableStateOf(MeetingTemplate.fromId(templateId)) }
 
     // Vertically scrollable so long summaries never hide the actions below.
     Column(
@@ -1009,9 +1020,11 @@ private fun SummaryTab(
         }
 
         if (meetingPhase == "completed" && transcriptAvailable && !activeHere) {
-            val regenerate = summaryState == "completed" && !aiSummary.isNullOrBlank()
             Button(
-                onClick = onGenerateSummary,
+                onClick = {
+                    pickedTemplate = MeetingTemplate.fromId(templateId)
+                    summaryDialogOpen = true
+                },
                 enabled = !recordingBusy && !anotherSummary,
                 modifier = Modifier.fillMaxWidth()
             ) {
@@ -1039,6 +1052,64 @@ private fun SummaryTab(
             modifier = Modifier
                 .fillMaxWidth()
                 .heightIn(min = 160.dp)
+        )
+    }
+
+    if (summaryDialogOpen) {
+        AlertDialog(
+            onDismissRequest = { summaryDialogOpen = false },
+            title = { Text(if (regenerate) "Replace summary?" else "Generate summary") },
+            text = {
+                Column {
+                    if (regenerate) {
+                        Text(
+                            "Are you sure? This replaces the existing summary with a new one.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Text(
+                        "Meeting profile",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Column(
+                        modifier = Modifier
+                            .heightIn(max = 320.dp)
+                            .verticalScroll(rememberScrollState())
+                    ) {
+                        MeetingTemplate.entries.forEach { template ->
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { pickedTemplate = template }
+                            ) {
+                                RadioButton(
+                                    selected = pickedTemplate == template,
+                                    onClick = { pickedTemplate = template }
+                                )
+                                Column(modifier = Modifier.padding(vertical = 8.dp)) {
+                                    Text(template.label, style = MaterialTheme.typography.bodyMedium)
+                                    Text(
+                                        template.detail,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    summaryDialogOpen = false
+                    onGenerateSummary(pickedTemplate.id)
+                }) { Text(if (regenerate) "Replace" else "Generate") }
+            },
+            dismissButton = {
+                TextButton(onClick = { summaryDialogOpen = false }) { Text("Cancel") }
+            }
         )
     }
 }

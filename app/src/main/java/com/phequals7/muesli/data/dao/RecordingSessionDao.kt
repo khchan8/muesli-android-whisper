@@ -31,6 +31,10 @@ interface RecordingSessionDao {
     @Query("UPDATE recording_sessions SET manualNotes = :notes WHERE id = :sessionId")
     suspend fun updateMeetingNotes(sessionId: String, notes: String): Int
 
+    /** Summary-profile switch for the next generation run. */
+    @Query("UPDATE recording_sessions SET templateId = :templateId WHERE id = :sessionId")
+    suspend fun updateSessionTemplate(sessionId: String, templateId: String): Int
+
     /** NULL-safe: only moves the path when the row still holds [expectedOldPath]. */
     @Query("UPDATE recording_sessions SET audioFileName = :newPath WHERE id = :sessionId AND audioFileName IS :expectedOldPath")
     suspend fun updateAudioPath(sessionId: String, expectedOldPath: String?, newPath: String): Int

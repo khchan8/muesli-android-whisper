@@ -280,6 +280,9 @@ class SharedStore(private val context: Context) {
     suspend fun updateMeetingNotes(sessionId: String, notes: String): Int =
         recordingSessionDao.updateMeetingNotes(sessionId, notes)
 
+    suspend fun updateSessionTemplate(sessionId: String, templateId: String): Int =
+        recordingSessionDao.updateSessionTemplate(sessionId, templateId)
+
     suspend fun updateRecordingAudioPath(sessionId: String, expectedOldPath: String?, newPath: String): Int =
         recordingSessionDao.updateAudioPath(sessionId, expectedOldPath, newPath)
 
